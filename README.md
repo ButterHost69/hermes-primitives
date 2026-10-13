@@ -63,12 +63,15 @@ agent/
 roles/
 ├── triage.py       # classify a message into a JSON verdict (write tools disabled)
 ├── diagnose.py     # diagnose an error trace into JSON findings + fixes (write tools disabled)
+├── reproduce.py    # reproduce a bug and write a failing regression test (write tools enabled)
 └── prompts/
     ├── triage.md   # the triage prompt template
-    └── diagnose.md # the diagnose prompt template
+    ├── diagnose.md # the diagnose prompt template
+    └── reproduce.md # the reproduce prompt template
 
 utils/
 ├── json_utils.py   # verify_json(): check model output is valid JSON
+└── path_utils.py   # path_resolves()/missing_paths(): check file paths exist
 ```
 
 Requires the `pi` executable on `PATH` and Python 3.9+.
@@ -95,5 +98,19 @@ pi-diagnose --model claude --cwd /path/to/project < traceback.txt
 `diagnose` runs Pi with write-capable tools disabled, loads its prompt from
 `roles/prompts/diagnose.md`, and asks the model to inspect the working tree
 and return a JSON object listing the files responsible for the error together
-with possible fixes for each.  If the response is not valid JSON, it retries
-once in the same session before giving up.
+with possible fixes for each.  If the response is not valid JSON, or if any
+reported file path does not resolve to an existing file in the working
+directory, it retries once in the same session before giving up.
+
+```sh
+pi-reproduce "the login button does nothing"
+pi-reproduce --model claude --cwd /path/to/project < bug_report.txt
+```
+
+`reproduce` runs Pi with write-capable tools *enabled* (it must create and run
+a test), loads its prompt from `roles/prompts/reproduce.md`, and asks the model
+to reproduce the reported bug and write a minimal regression test under
+`tests/`.  The prompt requires the model to observe the test **fail** against
+the buggy code before reporting success, so a reproduction that silently
+passes is rejected.  If the response is not valid JSON, it retries once in the
+same session before giving up.

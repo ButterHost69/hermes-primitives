@@ -272,6 +272,13 @@ def test_retry_includes_parser_error_when_given(make_session):
     assert "boom" in client.prompt_calls[-1][0]
 
 
+def test_retry_uses_custom_message_when_given(make_session):
+    client, session = make_session(events=settled_events("{}"))
+    session.retry(message="those files do not exist")
+    message = client.prompt_calls[-1][0]
+    assert message == "those files do not exist"
+
+
 # --------------------------------------------------------------------------- #
 # Integration against the fake `pi` subprocess (real PiClient)
 # --------------------------------------------------------------------------- #

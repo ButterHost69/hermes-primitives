@@ -2,7 +2,7 @@
 
 Runs Pi with write-capable tools disabled and prompts it through the
 ``agent`` package, retrying once if the model returns something that is not
-valid JSON.
+valid JSON or that references file paths which do not resolve.
 """
 
 from __future__ import annotations
@@ -11,15 +11,55 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from agent import PiError, PiSession, load_prompt
-from utils import verify_json
+from utils import missing_paths, verify_json
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 # Diagnose must only inspect, never modify. ``write``, ``edit`` and ``bash``
 # are all capable of changing the working tree, so they are disabled here.
 READ_ONLY_TOOLS = ("read", "grep", "find", "ls")
+
+
+def _finding_files(value: Any) -> list[str]:
+    """Extract the ``file`` paths from a parsed diagnosis."""
+    if not isinstance(value, dict):
+        return []
+    findings = value.get("findings")
+    if not isinstance(findings, list):
+        return []
+    files: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        file = finding.get("file")
+        if isinstance(file, str):
+            files.append(file)
+    return files
+
+
+def _missing_finding_files(value: Any, *, cwd: str | None) -> list[str]:
+    """Return the finding paths that do not resolve under ``cwd``."""
+    return missing_paths(_finding_files(value), cwd=cwd)
+
+
+def _path_retry_message(missing: list[str]) -> str:
+    """Build the corrective message for paths that do not resolve."""
+    lines = "\n".join(f"- {path}" for path in missing)
+    return (
+        "Your previous response referenced files that do not exist. "
+        "Respond again with only valid JSON and no other text.\n\n"
+        f"These paths do not resolve to files in the working directory:\n{lines}"
+    )
+
+
+def _path_error(missing: list[str]) -> str:
+    """Build the final error message for paths that still do not resolve."""
+    return "diagnose referenced paths that do not resolve to files: " + ", ".join(
+        missing
+    )
 
 
 def diagnose(
@@ -39,11 +79,22 @@ def diagnose(
     ) as session:
         output = session.run(prompt + "\n\n" + text)
         check = verify_json(output)
+        missing = _missing_finding_files(check.value, cwd=cwd) if check.ok else []
+
         if not check.ok:
             output = session.retry(error=check.error)
             check = verify_json(output)
+            missing = _missing_finding_files(check.value, cwd=cwd) if check.ok else []
+        elif missing:
+            output = session.retry(message=_path_retry_message(missing))
+            check = verify_json(output)
+            missing = _missing_finding_files(check.value, cwd=cwd) if check.ok else []
+
         if not check.ok:
             raise PiError("diagnose output was not valid JSON after a retry")
+        if missing:
+            raise PiError(_path_error(missing))
+
         return check.value
 
 

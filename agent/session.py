@@ -128,17 +128,20 @@ class PiSession:
         self,
         *,
         error: str | None = None,
+        message: str | None = None,
         timeout: float | None = None,
     ) -> str:
-        """Ask the model to fix a previous non-JSON response.
+        """Ask the model to fix a previous response.
 
         Sends a corrective message in the *same* session (no new session is
-        started) and returns the new text.
+        started) and returns the new text.  When ``message`` is given it is
+        sent verbatim; otherwise the default JSON-retry message is used.
         """
-        message = (
-            "Your previous response was not valid JSON. "
-            "Respond again with only valid JSON and no other text."
-        )
-        if error:
-            message += f"\n\nThe parser reported: {error}"
+        if message is None:
+            message = (
+                "Your previous response was not valid JSON. "
+                "Respond again with only valid JSON and no other text."
+            )
+            if error:
+                message += f"\n\nThe parser reported: {error}"
         return self.run(message, timeout=timeout)

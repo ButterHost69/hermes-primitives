@@ -20,14 +20,16 @@ class StubSession:
         self.outputs = outputs
         self.run_calls: list[str] = []
         self.retry_errors: list = []
+        self.retry_messages: list = []
         self.closed = False
 
     def run(self, message):
         self.run_calls.append(message)
         return self.outputs.pop(0)
 
-    def retry(self, *, error=None, timeout=None):
+    def retry(self, *, error=None, message=None, timeout=None):
         self.retry_errors.append(error)
+        self.retry_messages.append(message)
         return self.outputs.pop(0)
 
     def close(self):
@@ -64,10 +66,21 @@ def stubs(monkeypatch):
         monkeypatch.setattr(diagnose_module, "verify_json", verify)
         return calls
 
+    def set_missing(results):
+        calls: list[list] = []
+
+        def missing(paths, *, cwd=None):
+            calls.append(list(paths))
+            return results[len(calls) - 1]
+
+        monkeypatch.setattr(diagnose_module, "missing_paths", missing)
+        return calls
+
     return {
         "sessions": sessions,
         "outputs": outputs,
         "set_verify": set_verify,
+        "set_missing": set_missing,
     }
 
 
@@ -78,6 +91,7 @@ def test_diagnose_success_first_try(stubs):
     }
     stubs["outputs"].append('{"summary": "boom"}')
     verify_calls = stubs["set_verify"]([JsonCheck(ok=True, value=verdict)])
+    missing_calls = stubs["set_missing"]([[]])
 
     result = diagnose_module.diagnose(
         "traceback", model="claude", thinking="low", cwd="/tmp/x"
@@ -98,7 +112,9 @@ def test_diagnose_success_first_try(stubs):
     assert "PROMPT" in session.run_calls[0]
     assert "traceback" in session.run_calls[0]
     assert session.retry_errors == []
+    assert session.retry_messages == []
     assert len(verify_calls) == 1
+    assert missing_calls == [["a.py"]]
 
 
 def test_diagnose_disables_write_capable_tools(stubs):
@@ -132,6 +148,43 @@ def test_diagnose_raises_when_retry_still_not_json(stubs):
     ])
 
     with pytest.raises(PiError, match="not valid JSON"):
+        diagnose_module.diagnose("hi")
+    assert stubs["sessions"][0].closed is True
+
+
+def test_diagnose_retries_when_paths_do_not_resolve(stubs):
+    first = {"findings": [{"file": "a.py"}]}
+    second = {"findings": [{"file": "b.py"}]}
+    stubs["outputs"].extend(['{"findings": [{"file": "a.py"}]}', '{"findings": [{"file": "b.py"}]}'])
+    stubs["set_verify"]([
+        JsonCheck(ok=True, value=first),
+        JsonCheck(ok=True, value=second),
+    ])
+    missing_calls = stubs["set_missing"]([["a.py"], []])
+
+    result = diagnose_module.diagnose("hi")
+
+    assert result == second
+    session = stubs["sessions"][0]
+    assert len(session.run_calls) == 1
+    assert session.retry_errors == [None]
+    assert len(session.retry_messages) == 1
+    assert "a.py" in session.retry_messages[0]
+    assert "do not exist" in session.retry_messages[0]
+    assert missing_calls == [["a.py"], ["b.py"]]
+
+
+def test_diagnose_raises_when_paths_still_missing_after_retry(stubs):
+    first = {"findings": [{"file": "a.py"}]}
+    second = {"findings": [{"file": "a.py"}]}
+    stubs["outputs"].extend(['{"findings": [{"file": "a.py"}]}', '{"findings": [{"file": "a.py"}]}'])
+    stubs["set_verify"]([
+        JsonCheck(ok=True, value=first),
+        JsonCheck(ok=True, value=second),
+    ])
+    stubs["set_missing"]([["a.py"], ["a.py"]])
+
+    with pytest.raises(PiError, match="do not resolve to files"):
         diagnose_module.diagnose("hi")
     assert stubs["sessions"][0].closed is True
 
