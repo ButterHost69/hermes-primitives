@@ -9,7 +9,7 @@ final text back.
 from __future__ import annotations
 
 import threading
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .client import PiClient, PiError
 
@@ -33,6 +33,7 @@ class PiSession:
         persistent_session: bool = True,
         session_dir: str | None = None,
         timeout: float = 120.0,
+        observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.timeout = timeout
         self._parts: list[str] = []
@@ -46,6 +47,8 @@ class PiSession:
             session_dir=session_dir,
         )
         self.client.on_event(self._on_event)
+        if observer is not None:
+            self.client.on_event(observer)
         self.client.start()
 
     def close(self) -> None:

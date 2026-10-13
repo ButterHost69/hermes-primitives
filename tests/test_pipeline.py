@@ -15,15 +15,17 @@ def fake_roles(monkeypatch):
     reproduce_calls: list[dict] = []
     diagnose_calls: list[dict] = []
 
-    def reproduce(text, *, model=None, thinking=None, cwd=None):
+    def reproduce(text, *, model=None, thinking=None, cwd=None, observer=None, context=None):
         reproduce_calls.append(
-            {"text": text, "model": model, "thinking": thinking, "cwd": cwd}
+            {"text": text, "model": model, "thinking": thinking, "cwd": cwd,
+             "observer": observer, "context": context}
         )
         return {"summary": "reproduced", "test_fails": True}
 
-    def diagnose(text, *, model=None, thinking=None, cwd=None):
+    def diagnose(text, *, model=None, thinking=None, cwd=None, observer=None, context=None):
         diagnose_calls.append(
-            {"text": text, "model": model, "thinking": thinking, "cwd": cwd}
+            {"text": text, "model": model, "thinking": thinking, "cwd": cwd,
+             "observer": observer, "context": context}
         )
         return {"summary": "diagnosed"}
 
@@ -77,3 +79,39 @@ def test_api_key_not_forwarded(fake_roles, tmp_path):
     for calls in (fake_roles["reproduce"], fake_roles["diagnose"]):
         for call in calls:
             assert "api_key" not in call
+
+
+def test_role_names(fake_roles, tmp_path):
+    pipe = pipeline.Pipeline(tmp_path, "claude", "low", "secret")
+    assert pipe.role_names == ["reproduce", "diagnose"]
+
+
+def test_run_step_runs_one_role(fake_roles, tmp_path):
+    pipe = pipeline.Pipeline(tmp_path, "claude", "low", "secret")
+    result = pipe.run_step("reproduce", "prompt")
+    assert result == {"summary": "reproduced", "test_fails": True}
+    assert pipe.state["reproduce"] == result
+
+
+def test_run_step_unknown_role_raises(fake_roles, tmp_path):
+    pipe = pipeline.Pipeline(tmp_path, "claude", "low", "secret")
+    with pytest.raises(KeyError):
+        pipe.run_step("nope", "x")
+
+
+def test_run_step_passes_context_and_observer(fake_roles, tmp_path):
+    observer = lambda record: None  # noqa: E731
+    pipe = pipeline.Pipeline(tmp_path, "claude", "low", "secret", observer=observer)
+    pipe.run_step("reproduce", "prompt", context="extra")
+    call = fake_roles["reproduce"][0]
+    assert call["context"] == "extra"
+    assert call["observer"] is observer
+
+
+def test_run_does_not_pass_observer_when_none(fake_roles, tmp_path):
+    pipe = pipeline.Pipeline(tmp_path, "claude", "low", "secret")
+    pipe.run("x")
+    for calls in (fake_roles["reproduce"], fake_roles["diagnose"]):
+        for call in calls:
+            assert call["observer"] is None
+            assert call["context"] is None

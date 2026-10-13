@@ -72,6 +72,13 @@ roles/
 utils/
 ├── json_utils.py   # verify_json(): check model output is valid JSON
 └── path_utils.py   # path_resolves()/missing_paths(): check file paths exist
+
+tui/
+├── __main__.py     # CLI entry point (python -m tui / pi-pipeline)
+├── app.py          # PipelineApp: drives the pipeline in a live terminal UI
+├── screen.py       # raw mode, frame painting, and key parsing
+├── theme.py        # OKHSL -> ANSI truecolor, matching Pi's dark/light themes
+└── transcript.py   # ordered, bounded stream of role activity
 ```
 
 Requires the `pi` executable on `PATH` and Python 3.9+.
@@ -114,3 +121,32 @@ to reproduce the reported bug and write a minimal regression test under
 the buggy code before reporting success, so a reproduction that silently
 passes is rejected.  If the response is not valid JSON, it retries once in the
 same session before giving up.
+
+## Interactive pipeline (TUI)
+
+The `tui` package wraps :class:`pipeline.Pipeline` in a full-screen terminal
+UI that streams each role's activity live — assistant text, tool calls, role
+banners, and a status bar — in a color palette faithful to Pi's `dark` (and
+`light`) themes.  The only interaction points are where a human must type:
+
+```sh
+python -m tui /path/to/codebase
+python -m tui /path/to/codebase --model claude --thinking low --theme dark
+pi-pipeline /path/to/codebase --theme light
+```
+
+You are prompted for the bug report first.  The `reproduce` role then runs
+while you watch it stream, and before `diagnose` starts you can press Enter to
+continue, type a message to add as operator context, or `/quit`.  Once the
+pipeline finishes, the collected role results are printed below the screen.
+
+| Key | Action |
+|---|---|
+| type + Enter | enter the bug report / optional context |
+| Enter | continue to the next role |
+| `/quit` | exit at any input prompt |
+| `Ctrl+U` | clear the input line |
+| `Ctrl+C` | during a role: quit after the current role finishes |
+
+Controls available while a role is running are minimal by design — the TUI is
+a watchable view of the pipeline, not a second interactive agent session.

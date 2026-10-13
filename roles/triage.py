@@ -11,6 +11,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 from agent import PiError, PiSession, load_prompt
 from utils import verify_json
@@ -28,14 +29,25 @@ def triage(
     model: str | None = None,
     thinking: str | None = None,
     cwd: str | None = None,
+    observer: Callable[[dict[str, Any]], None] | None = None,
+    context: str | None = None,
 ) -> dict:
-    """Classify ``text`` and return the model's JSON verdict."""
+    """Classify ``text`` and return the model's JSON verdict.
+
+    ``observer``, when given, is registered as an extra event listener on the
+    session's RPC client so callers can stream progress without changing the
+    synchronous request/response contract.  ``context`` is appended to the
+    role prompt as optional operator guidance.
+    """
     prompt = load_prompt(PROMPTS_DIR / "triage.md")
+    if context:
+        prompt += "\n\n" + context
     with PiSession(
         tools=READ_ONLY_TOOLS,
         model=model,
         thinking=thinking,
         cwd=cwd,
+        observer=observer,
     ) as session:
         output = session.run(prompt + "\n\n" + text)
         check = verify_json(output)

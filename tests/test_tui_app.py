@@ -1,0 +1,540 @@
+"""Tests for the interactive pipeline TUI application."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from tui.app import PipelineApp
+from tui.screen import visible_width
+
+
+class FakePipeline:
+    """Minimal stand-in for ``pipeline.Pipeline``."""
+
+    def __init__(self):
+        self.role_names = ["reproduce", "diagnose"]
+        self.model_name = "claude"
+        self.reasoning = "low"
+        self.observer = None
+        self.run_step_calls: list[tuple] = []
+        self.results = {
+            "reproduce": {"summary": "reproduced", "test_fails": True},
+            "diagnose": {"summary": "diagnosed"},
+        }
+        self.fail = False
+
+    def run_step(self, name, previous, context=None):
+        self.run_step_calls.append((name, previous, context))
+        if self.fail:
+            raise RuntimeError("boom")
+        return self.results.get(name)
+
+
+@pytest.fixture
+def fake_pipeline():
+    return FakePipeline()
+
+
+@pytest.fixture
+def app(fake_pipeline):
+    return PipelineApp(fake_pipeline, color=False)
+
+
+@pytest.fixture
+def sized_app(app, monkeypatch):
+    monkeypatch.setattr(app.term, "size", lambda: (80, 24))
+    return app
+
+
+# --------------------------------------------------------------------------- #
+# Brief args
+# --------------------------------------------------------------------------- #
+def test_brief_args_bash(app):
+    assert "ls" in app._brief_args("bash", {"command": "ls -la"})
+
+
+def test_brief_args_truncates_long_command(app):
+    assert len(app._brief_args("bash", {"command": "x" * 200})) <= 70
+
+
+def test_brief_args_read_path(app):
+    assert "file.txt" in app._brief_args("read", {"path": "file.txt"})
+
+
+def test_brief_args_grep_pattern(app):
+    assert "pat" in app._brief_args("grep", {"pattern": "pat"})
+
+
+def test_brief_args_unknown_tool(app):
+    assert app._brief_args("whatever", {}) == ""
+
+
+# --------------------------------------------------------------------------- #
+# Event translation
+# --------------------------------------------------------------------------- #
+def test_translate_text_delta(app):
+    app._translate({"type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "hi"}})
+    assert app.transcript.partial() == ("text", "hi")
+
+
+def test_translate_thinking_shown(app):
+    app._translate({"type": "message_update",
+                    "assistantMessageEvent": {"type": "thinking_delta", "delta": "hmm"}})
+    assert app.transcript.partial() == ("thinking", "hmm")
+
+
+def test_translate_thinking_hidden(fake_pipeline):
+    app = PipelineApp(fake_pipeline, color=False, show_thinking=False)
+    app._translate({"type": "message_update",
+                    "assistantMessageEvent": {"type": "thinking_delta", "delta": "hmm"}})
+    assert app.transcript.partial() == ("text", "")
+
+
+def test_translate_tool_start_and_end(app):
+    app._translate({"type": "tool_execution_start", "toolName": "bash",
+                    "args": {"command": "ls"}})
+    app._translate({"type": "tool_execution_end", "toolName": "bash",
+                    "isError": False, "durationMs": 12})
+    assert app.transcript.lines[-1][0] == "tool"
+    assert "✓" in app.transcript.lines[-1][1]
+    assert "12 ms" in app.transcript.lines[-1][1]
+
+
+def test_translate_tool_error_marker(app):
+    app._translate({"type": "tool_execution_start", "toolName": "bash", "args": {}})
+    app._translate({"type": "tool_execution_end", "toolName": "bash", "isError": True})
+    assert "✗" in app.transcript.lines[-1][1]
+
+
+def test_translate_settle_flushes(app):
+    app._translate({"type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "x"}})
+    app._translate({"type": "agent_settled"})
+    assert app.transcript.lines[-1] == ("text", "x")
+
+
+def test_translate_auto_retry(app):
+    app._translate({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 10})
+    assert "retry 1/3" in app.transcript.lines[-1][1]
+
+
+# --------------------------------------------------------------------------- #
+# Styling
+# --------------------------------------------------------------------------- #
+def test_style_line_kinds(sized_app):
+    assert sized_app._style_line("role", "x").startswith("\x1b[1;")  # bold
+    assert sized_app._style_line("thinking", "x").startswith("\x1b[3;")  # italic
+    assert sized_app._style_line("text", "x").startswith("\x1b[38;2;")
+    assert sized_app._style_line("tool", "x").startswith("\x1b[38;2;")
+    assert sized_app._style_line("error", "x").startswith("\x1b[38;2;")
+
+
+def test_summarize_result_json(sized_app):
+    assert "✓ reproduce" in sized_app._summarize_result("reproduce", {"a": 1})
+
+
+def test_summarize_result_truncates_long(sized_app):
+    out = sized_app._summarize_result("diagnose", "x" * 500)
+    assert len(out) <= 200
+
+
+# --------------------------------------------------------------------------- #
+# Input editing
+# --------------------------------------------------------------------------- #
+def test_edit_insert_and_backspace(app):
+    app.phase = "input"
+    app._edit_input("h")
+    app._edit_input("i")
+    assert app.input_line == "hi"
+    app._edit_input("\x7f")
+    assert app.input_line == "h"
+
+
+def test_edit_left_right_and_home_end(app):
+    app.phase = "input"
+    for ch in "abc":
+        app._edit_input(ch)
+    app._edit_input("LEFT")
+    assert app.input_cursor == 2
+    app._edit_input("HOME")
+    assert app.input_cursor == 0
+    app._edit_input("END")
+    assert app.input_cursor == 3
+    app._edit_input("RIGHT")
+    assert app.input_cursor == 3
+
+
+def test_edit_delete_forward(app):
+    app.phase = "input"
+    for ch in "abc":
+        app._edit_input(ch)
+    app._edit_input("HOME")
+    app._edit_input("DELETE")
+    assert app.input_line == "bc"
+
+
+def test_edit_ctrl_u_clears(app):
+    app.phase = "input"
+    for ch in "abc":
+        app._edit_input(ch)
+    app._edit_input("\x15")
+    assert app.input_line == "" and app.input_cursor == 0
+
+
+def test_edit_ctrl_d_empty_quits(app):
+    app.phase = "input"
+    app._edit_input("\x04")
+    assert app.done is True
+
+
+def test_submit_empty_input_ignored(app):
+    app.phase = "input"
+    app._submit()
+    assert app.phase == "input"
+
+
+def test_submit_quit_command(app):
+    app.phase = "input"
+    app.input_line = "/quit"
+    app._submit()
+    assert app.done is True
+
+
+def test_submit_input_starts_first_role(fake_pipeline):
+    app = PipelineApp(fake_pipeline, color=False)
+    app.phase = "input"
+    app.input_line = "the login button does nothing"
+    app._submit()
+    assert app.phase == "running"
+    assert app.current_role == "reproduce"
+    assert app.previous == "the login button does nothing"
+
+
+def test_submit_between_starts_next_role_with_context(fake_pipeline):
+    app = PipelineApp(fake_pipeline, color=False)
+    app.phase = "between"
+    app.role_index = 0
+    app.previous = {"summary": "reproduced"}
+    app.input_line = "extra context"
+    app._submit()
+    assert app.current_role == "diagnose"
+
+
+# --------------------------------------------------------------------------- #
+# Role execution
+# --------------------------------------------------------------------------- #
+def test_run_role_and_check_done(fake_pipeline):
+    app = PipelineApp(fake_pipeline, color=False)
+    app.previous = "prompt"
+    app._start_role(0)
+    assert app._role_done_event.wait(2.0)
+    # Let the worker finish posting its result.
+    for _ in range(100):
+        if app._role_done is not None:
+            break
+        time.sleep(0.01)
+    app._check_role_done()
+    assert app.phase == "between"
+    assert app.results["reproduce"] == {"summary": "reproduced", "test_fails": True}
+    assert fake_pipeline.run_step_calls[0][0] == "reproduce"
+    assert fake_pipeline.run_step_calls[0][1] == "prompt"
+
+
+def test_run_last_role_reaches_done(fake_pipeline):
+    app = PipelineApp(fake_pipeline, color=False)
+    app.previous = {"summary": "reproduced"}
+    app.role_index = 1
+    app.current_role = "diagnose"
+    app.phase = "running"
+    app._role_done = ("diagnose", {"summary": "diagnosed"}, None)
+    app._check_role_done()
+    assert app.phase == "done"
+    assert app.error is None
+
+
+def test_run_role_error_marks_done(fake_pipeline):
+    app = PipelineApp(fake_pipeline, color=False)
+    app.phase = "running"
+    app._role_done = ("reproduce", None, RuntimeError("boom"))
+    app._check_role_done()
+    assert app.phase == "done"
+    assert app.error == "boom"
+
+
+def test_handle_key_running_ctrl_c_sets_quit(app):
+    app.phase = "running"
+    app._handle_key("\x03")
+    assert app._quit_requested is True
+
+
+def test_handle_key_done_quits(app):
+    app.phase = "done"
+    app._handle_key("q")
+    assert app.done is True
+
+
+# --------------------------------------------------------------------------- #
+# Frame building
+# --------------------------------------------------------------------------- #
+def test_build_frame_shape(sized_app):
+    sized_app.phase = "input"
+    sized_app.input_line = "hello"
+    sized_app.input_cursor = 5
+    lines, cursor = sized_app._build_frame()
+    assert len(lines) == 24
+    assert cursor == (21, 9)  # input row, after "› " + 5 chars
+
+
+def test_build_frame_running_hint(sized_app):
+    sized_app.phase = "running"
+    sized_app.current_role = "reproduce"
+    lines, cursor = sized_app._build_frame()
+    assert cursor is None
+
+
+def test_body_chunks_wrap_and_tail(sized_app):
+    sized_app.transcript.text("word " * 50)
+    sized_app.transcript.settle()
+    chunks = sized_app._body_chunks(20, 3)
+    assert len(chunks) == 3
+    assert all(len(c) <= 20 for _, c in chunks)
+
+
+def test_rule_and_row_width(sized_app):
+    assert visible_width(sized_app._rule("\u256d", "\u256e")) == 80
+    assert visible_width(sized_app._row("x")) == 80
+
+
+def test_header_content(sized_app):
+    sized_app.current_role = "reproduce"
+    assert "hms pipeline" in sized_app._header_content()
+    assert "role 1/2" in sized_app._header_content()
+
+
+def test_status_content_input(sized_app):
+    sized_app.phase = "input"
+    assert "bug report" in sized_app._status_content()
+
+
+def test_status_content_running(sized_app):
+    sized_app.phase = "running"
+    sized_app.current_role = "reproduce"
+    sized_app.elapsed_start = time.monotonic()
+    assert "running reproduce" in sized_app._status_content()
+
+
+def test_status_content_done_error(sized_app):
+    sized_app.phase = "done"
+    sized_app.error = "boom"
+    assert "boom" in sized_app._status_content()
+
+
+def test_prompt_content(sized_app):
+    sized_app.input_line = "hi"
+    assert "hi" in sized_app._prompt_content()
+    assert "\u203a" in sized_app._prompt_content()
+
+
+# --------------------------------------------------------------------------- #
+# Full run loop (headless)
+# --------------------------------------------------------------------------- #
+def test_run_quits_on_ctrl_d(fake_pipeline, monkeypatch):
+    app = PipelineApp(fake_pipeline, color=False)
+    monkeypatch.setattr(app.term, "size", lambda: (80, 24))
+    monkeypatch.setattr(app.term, "enter", lambda: None)
+    monkeypatch.setattr(app.term, "exit", lambda: None)
+    monkeypatch.setattr(app.term, "read_key", lambda timeout=None: "\x04")
+    assert app.run() == {}
+    assert app.done is True
+
+
+def test_run_handles_none_key(fake_pipeline, monkeypatch):
+    app = PipelineApp(fake_pipeline, color=False)
+    monkeypatch.setattr(app.term, "size", lambda: (80, 24))
+    monkeypatch.setattr(app.term, "enter", lambda: None)
+    monkeypatch.setattr(app.term, "exit", lambda: None)
+    calls = {"n": 0}
+
+    def read_key(timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return "\x04"
+
+    monkeypatch.setattr(app.term, "read_key", read_key)
+    assert app.run() == {}
+
+
+# --------------------------------------------------------------------------- #
+# Observer / event draining
+# --------------------------------------------------------------------------- #
+def test_observer_and_drain(app):
+    app._observer({"type": "message_update",
+                   "assistantMessageEvent": {"type": "text_delta", "delta": "hi"}})
+    app._drain_events()
+    assert app.transcript.partial() == ("text", "hi")
+
+
+def test_translate_unknown_type(app):
+    app._translate({"type": "bogus"})  # falls through without error
+
+
+# --------------------------------------------------------------------------- #
+# More brief-args / summarize branches
+# --------------------------------------------------------------------------- #
+def test_brief_args_non_string_values(app):
+    assert app._brief_args("bash", {"command": 123}) == ""
+    assert app._brief_args("read", {"path": 123}) == ""
+    assert app._brief_args("grep", {"pattern": 123}) == ""
+
+
+def test_summarize_result_non_serializable(sized_app):
+    out = sized_app._summarize_result("x", object())
+    assert "\u2713 x" in out
+
+
+# --------------------------------------------------------------------------- #
+# More handle-key branches
+# --------------------------------------------------------------------------- #
+def test_handle_key_running_other_key(app):
+    app.phase = "running"
+    app._handle_key("x")
+    assert app._quit_requested is False
+
+
+def test_handle_key_done_other_key(app):
+    app.phase = "done"
+    app._handle_key("x")
+    assert app.done is False
+
+
+def test_handle_key_unknown_phase(app):
+    app.phase = "bogus"
+    app._handle_key("x")  # no-op
+
+
+# --------------------------------------------------------------------------- #
+# More input-editing branches
+# --------------------------------------------------------------------------- #
+def test_edit_enter_submits(fake_pipeline):
+    app = PipelineApp(fake_pipeline, color=False)
+    app.phase = "input"
+    app.input_line = "bug"
+    app._edit_input("\r")
+    assert app.phase == "running"
+    assert app.current_role == "reproduce"
+
+
+def test_edit_ctrl_d_deletes_forward(app):
+    app.phase = "input"
+    app.input_line = "abc"
+    app.input_cursor = 0
+    app._edit_input("\x04")
+    assert app.input_line == "bc"
+
+
+def test_edit_ctrl_d_at_end_is_noop(app):
+    app.phase = "input"
+    app.input_line = "a"
+    app.input_cursor = 1
+    app._edit_input("\x04")
+    assert app.input_line == "a"
+
+
+def test_edit_arrow_and_escape_ignored(app):
+    app.phase = "input"
+    app._edit_input("UP")
+    app._edit_input("DOWN")
+    app._edit_input("ESC")
+    assert app.input_line == ""
+
+
+def test_edit_nonprintable_ignored(app):
+    app.phase = "input"
+    app._edit_input("\x01")
+    assert app.input_line == ""
+
+
+def test_delete_backward_at_start(app):
+    app.input_line = "a"
+    app.input_cursor = 0
+    app._delete_backward()
+    assert app.input_line == "a"
+
+
+def test_delete_forward_at_end(app):
+    app.input_line = "a"
+    app.input_cursor = 1
+    app._delete_forward()
+    assert app.input_line == "a"
+
+
+def test_submit_unknown_phase(app):
+    app.phase = "done"
+    app.input_line = "x"
+    app._submit()
+    assert app.phase == "done"
+
+
+# --------------------------------------------------------------------------- #
+# More frame-building branches
+# --------------------------------------------------------------------------- #
+def test_body_chunks_multiple_short_lines(sized_app):
+    sized_app.transcript.text("a\nb")
+    sized_app.transcript.settle()
+    assert sized_app._body_chunks(10, 5) == [("text", "a"), ("text", "b")]
+
+
+def test_body_chunks_includes_pending(sized_app):
+    sized_app.transcript.text("pending")
+    assert sized_app._body_chunks(10, 3) == [("text", "pending")]
+
+
+def test_body_chunks_pending_wraps_beyond_height(sized_app):
+    sized_app.transcript.text("x" * 100)
+    chunks = sized_app._body_chunks(10, 3)
+    assert len(chunks) == 3
+
+
+def test_style_line_info_and_result(sized_app):
+    assert sized_app._style_line("info", "x").startswith("\x1b[38;2;")
+    assert sized_app._style_line("result", "x").startswith("\x1b[38;2;")
+
+
+def test_phase_hint_done(sized_app):
+    sized_app.phase = "done"
+    assert "quit" in sized_app._phase_hint()
+
+
+def test_phase_hint_other(sized_app):
+    sized_app.phase = "input"
+    assert sized_app._phase_hint() == ""
+
+
+def test_status_content_between(sized_app):
+    sized_app.phase = "between"
+    assert "Enter" in sized_app._status_content()
+
+
+def test_status_content_done_success(sized_app):
+    sized_app.phase = "done"
+    assert "pipeline complete" in sized_app._status_content()
+
+
+def test_status_content_running_no_elapsed(sized_app):
+    sized_app.phase = "running"
+    sized_app.current_role = "reproduce"
+    sized_app.elapsed_start = None
+    assert "running reproduce" in sized_app._status_content()
+
+
+def test_build_frame_with_transcript(sized_app):
+    sized_app.phase = "running"
+    sized_app.current_role = "reproduce"
+    sized_app.transcript.text("hello world")
+    sized_app.transcript.settle()
+    lines, _ = sized_app._build_frame()
+    assert any("hello" in line for line in lines)

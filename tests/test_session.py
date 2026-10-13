@@ -90,6 +90,21 @@ def test_init_registers_event_handler_and_timeout(make_session):
     assert client.started is True
 
 
+def test_init_registers_observer(make_session):
+    def observer(record):
+        pass
+
+    client, session = make_session(observer=observer)
+    assert client.handlers == [session._on_event, observer]
+
+
+def test_observer_receives_streamed_events(make_session):
+    seen = []
+    _, session = make_session(observer=seen.append, events=settled_events("hi"))
+    session.run("hi")
+    assert any(r["type"] == "message_update" for r in seen)
+
+
 def test_init_forwards_config_to_owned_client(make_session):
     client, _ = make_session(
         tools=["read"],
