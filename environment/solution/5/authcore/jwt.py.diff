@@ -1,0 +1,14 @@
+diff --git a/authcore/jwt.py b/authcore/jwt.py
+index 09ac3e0..2affc93 100755
+--- a/authcore/jwt.py
++++ b/authcore/jwt.py
+@@ -34,9 +34,6 @@ def decode(token: str, secret: str) -> dict:
+     except Exception:
+         raise InvalidToken("invalid header")
+ 
+-    if header.get("alg") == "none":
+-        return json.loads(b64url_decode(payload_b64))
+-
+     if header.get("alg") != "HS256":
+         raise InvalidToken("unsupported algorithm")
+ 

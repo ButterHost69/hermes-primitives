@@ -1,0 +1,11 @@
+diff --git a/queuemaster/backoff.py b/queuemaster/backoff.py
+index 71fa5ae..deacd73 100755
+--- a/queuemaster/backoff.py
++++ b/queuemaster/backoff.py
+@@ -7,5 +7,5 @@ def backoff_delay(attempt: int, base: float = 1.0, max_delay: float = 60.0) -> f
+     """
+     if attempt < 1:
+         raise ValueError("attempt must be >= 1")
+-    delay = base * (2 ** attempt)
++    delay = base * (2 ** (attempt - 1))
+     return min(delay, max_delay)

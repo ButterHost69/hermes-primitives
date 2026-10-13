@@ -1,0 +1,13 @@
+diff --git a/calclang/parser.py b/calclang/parser.py
+index 7d64a5b..490a5b8 100755
+--- a/calclang/parser.py
++++ b/calclang/parser.py
+@@ -33,7 +33,7 @@ class Parser:
+ 
+     def parse_term(self):
+         node = self.parse_factor()
+-        while self.peek()[0] in ("+", "-", "*", "/"):
++        while self.peek()[0] in ("*", "/"):
+             op = self.consume()[0]
+             right = self.parse_factor()
+             node = BinOp(op, node, right)

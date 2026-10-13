@@ -1,23 +1,44 @@
-# Codebase 4 — Visitor registry
+# QueueMaster
 
-**Difficulty: 4/5 (hard)**
+QueueMaster is a small distributed task scheduler / job queue library written
+in pure Python (standard library only, no external dependencies). It provides
+two building blocks:
 
-`record_visit` records a visitor id and returns the ids recorded during that call.
-Every call should produce a fresh list that contains only the visitor recorded in
-that call.
+- **`queuemaster.scheduler`** — a priority-queue scheduler backed by a min-heap
+  (`heapq`). Submit `Task`s and pull the highest-priority one with `next()`.
+  Lower priority number = higher priority.
+- **`queuemaster.backoff`** — an exponential backoff helper for retries. The
+  first retry waits `base` seconds, each subsequent retry doubles the previous
+  delay, capped at `max_delay`.
+- **`queuemaster.tasks`** — a simple `Task` class carrying a `name`,
+  `priority`, and optional `payload`.
 
-## Expected behaviour
+## Example
 
-- `record_visit(1)` == `[1]`
-- `record_visit(2)` == `[2]`
-- `record_visit(3)` == `[3]`
+```python
+from queuemaster import scheduler, tasks, backoff
 
-(Each call is independent — the list must not accumulate across calls.)
+s = scheduler.Scheduler()
+s.submit(tasks.Task("send_email", priority=2, payload={"to": "a@example.com"}))
+s.submit(tasks.Task("flush_logs", priority=1, payload=None))
 
-## Run the tests
+task = s.next()  # flush_logs (priority 1 comes first)
+print(task.name)
 
+delay = backoff.backoff_delay(attempt=3, base=1.0, max_delay=60.0)
+print(delay)  # 4.0
 ```
-python -m pytest
+
+## Running the tests
+
+With the standard library:
+
+```bash
+python3 -m unittest discover -s tests -t .
 ```
 
-There is exactly one bug. Fix it so the tests pass.
+Or, if you have pytest installed:
+
+```bash
+python3 -m pytest
+```

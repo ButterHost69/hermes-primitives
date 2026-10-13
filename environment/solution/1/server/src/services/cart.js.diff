@@ -1,0 +1,12 @@
+diff --git a/server/src/services/cart.js b/server/src/services/cart.js
+index c1bfdee..32f814d 100755
+--- a/server/src/services/cart.js
++++ b/server/src/services/cart.js
+@@ -1,6 +1,6 @@
+ const computeOrderTotal = (items, { discountPercent = 0, taxRate = 0, shipping = 0 } = {}) => {
+   const subtotal = items.reduce((sum, it) => sum + it.price * it.quantity, 0);
+-  const discount = subtotal * discountPercent;
++  const discount = subtotal * (discountPercent / 100);
+   const taxable = subtotal - discount;
+   const tax = taxable * taxRate;
+   return Math.round((taxable + tax + shipping) * 100) / 100;

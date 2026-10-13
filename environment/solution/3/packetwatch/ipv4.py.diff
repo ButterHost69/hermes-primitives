@@ -1,0 +1,13 @@
+diff --git a/packetwatch/ipv4.py b/packetwatch/ipv4.py
+index b0642ff..56d3971 100755
+--- a/packetwatch/ipv4.py
++++ b/packetwatch/ipv4.py
+@@ -14,7 +14,7 @@ class IPv4Header:
+ def parse(data: bytes):
+     if len(data) < 20:
+         raise ValueError("IPv4 header must be at least 20 bytes")
+-    total_length = struct.unpack("<H", data[2:4])[0]
++    total_length = struct.unpack(">H", data[2:4])[0]
+     identification = struct.unpack(">H", data[4:6])[0]
+     ttl = data[8]
+     protocol = data[9]
