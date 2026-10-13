@@ -10,6 +10,15 @@ import re
 from pathlib import Path
 
 
+def load_prompt(path: Path | str) -> str:
+    """Load a prompt from a Markdown file and return its text.
+
+    Surrounding whitespace is stripped so the prompt can be sent to the
+    model as-is.
+    """
+    return Path(path).read_text(encoding="utf-8").strip()
+
+
 class PromptLibrary:
     """Read/write named prompt templates in a directory."""
 

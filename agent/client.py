@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import subprocess
 import threading
 import time
@@ -33,13 +34,15 @@ class PiClient:
         model: str | None = None,
         thinking: str | None = None,
         cwd: str | None = None,
-        persistent_session: bool = False,
+        persistent_session: bool = True,
+        session_dir: str | None = None,
     ) -> None:
         self.tools: Sequence[str] | None = tools
         self.model = model
         self.thinking = thinking
         self.cwd = cwd
         self.persistent_session = persistent_session
+        self.session_dir = session_dir
 
         self._process: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
@@ -56,6 +59,15 @@ class PiClient:
     def running(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
+    def _session_dir(self) -> str:
+        """Directory where Pi persists this session.
+
+        Defaults to ``.sessions/`` under the session's working directory.
+        """
+        if self.session_dir is not None:
+            return self.session_dir
+        return os.path.join(self.cwd or os.getcwd(), ".sessions")
+
     def _build_argv(self) -> list[str]:
         """Build the ``pi`` argument list from the current configuration."""
         exe = which("pi")
@@ -65,7 +77,9 @@ class PiClient:
             )
 
         argv = [exe, "--mode", "rpc"]
-        if not self.persistent_session:
+        if self.persistent_session:
+            argv += ["--session-dir", self._session_dir()]
+        else:
             argv.append("--no-session")
         if self.model:
             argv += ["--model", self.model]

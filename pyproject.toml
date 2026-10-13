@@ -10,6 +10,8 @@ dependencies = [
 
 [project.scripts]
 pi-agent = "agent.__main__:main"
+pi-triage = "roles.triage:main"
+pi-diagnose = "roles.diagnose:main"
 
 [dependency-groups]
 dev = [

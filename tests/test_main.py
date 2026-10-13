@@ -24,7 +24,6 @@ def test_parser_defaults():
     assert args.thinking is None
     assert args.cwd is None
     assert args.prompts_dir == str(main_module.DEFAULT_PROMPTS_DIR)
-    assert args.session is False
     assert args.no_color is False
 
 
@@ -36,7 +35,6 @@ def test_parser_all_flags():
         "--thinking", "low",
         "--cwd", "/tmp/x",
         "--prompts-dir", "/tmp/prompts",
-        "-s",
         "--no-color",
     )
     assert args.tools == "read,bash"
@@ -45,7 +43,6 @@ def test_parser_all_flags():
     assert args.thinking == "low"
     assert args.cwd == "/tmp/x"
     assert args.prompts_dir == "/tmp/prompts"
-    assert args.session is True
     assert args.no_color is True
 
 
@@ -79,7 +76,7 @@ def test_build_client_defaults():
     assert client.kwargs["tools"] == default_tools()
     assert client.kwargs["model"] is None
     assert client.kwargs["thinking"] is None
-    assert client.kwargs["persistent_session"] is False
+    assert "persistent_session" not in client.kwargs  # persistence is the default
     assert client.started is True
 
 
@@ -97,13 +94,12 @@ def test_build_client_tools_default():
     assert client.kwargs["tools"] == default_tools()
 
 
-def test_build_client_model_thinking_cwd_session():
-    args = parse("-m", "claude", "--thinking", "low", "--cwd", "/x", "-s")
+def test_build_client_model_thinking_cwd():
+    args = parse("-m", "claude", "--thinking", "low", "--cwd", "/x")
     client = main_module.build_client(args)
     assert client.kwargs["model"] == "claude"
     assert client.kwargs["thinking"] == "low"
     assert client.kwargs["cwd"] == "/x"
-    assert client.kwargs["persistent_session"] is True
 
 
 def test_build_client_start_failure(monkeypatch, capsys):

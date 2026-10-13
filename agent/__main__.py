@@ -62,12 +62,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"custom prompt library directory (default: {DEFAULT_PROMPTS_DIR})",
     )
     parser.add_argument(
-        "-s",
-        "--session",
-        action="store_true",
-        help="persist the session to disk (default: in-memory only)",
-    )
-    parser.add_argument(
         "--no-color",
         action="store_true",
         help="disable colored output",
@@ -97,7 +91,6 @@ def build_client(args: argparse.Namespace) -> PiClient:
         model=args.model or None,
         thinking=args.thinking or None,
         cwd=args.cwd or os.getcwd(),
-        persistent_session=bool(args.session),
     )
     try:
         client.start()

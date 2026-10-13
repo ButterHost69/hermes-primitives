@@ -19,20 +19,41 @@ def make_client(**kwargs) -> PiClient:
 # --------------------------------------------------------------------------- #
 # Argument building (no subprocess)
 # --------------------------------------------------------------------------- #
-def test_build_argv_defaults(monkeypatch):
+def test_build_argv_defaults(monkeypatch, tmp_path):
     monkeypatch.setattr(client_module, "which", lambda name: "/fake/pi")
+    monkeypatch.chdir(tmp_path)
     client = make_client()
     argv = client._build_argv()
     assert argv[0] == "/fake/pi"
     assert argv[1] == "--mode"
     assert argv[2] == "rpc"
-    assert "--no-session" in argv
+    assert "--no-session" not in argv
+    assert argv[argv.index("--session-dir") + 1] == str(tmp_path / ".sessions")
 
 
-def test_build_argv_persistent_session(monkeypatch):
+def test_build_argv_persistent_session_uses_session_dir(monkeypatch):
     monkeypatch.setattr(client_module, "which", lambda name: "/fake/pi")
-    client = make_client(persistent_session=True)
-    assert "--no-session" not in client._build_argv()
+    client = make_client(persistent_session=True, session_dir="/tmp/sessions")
+    argv = client._build_argv()
+    assert "--no-session" not in argv
+    assert argv[argv.index("--session-dir") + 1] == "/tmp/sessions"
+
+
+def test_build_argv_no_session(monkeypatch):
+    monkeypatch.setattr(client_module, "which", lambda name: "/fake/pi")
+    client = make_client(persistent_session=False)
+    argv = client._build_argv()
+    assert "--no-session" in argv
+    assert "--session-dir" not in argv
+
+
+def test_session_dir_defaults_to_cwd_sessions():
+    assert make_client(cwd="/work/proj")._session_dir() == "/work/proj/.sessions"
+
+
+def test_session_dir_explicit_overrides_cwd():
+    client = make_client(cwd="/work/proj", session_dir="/elsewhere")
+    assert client._session_dir() == "/elsewhere"
 
 
 def test_build_argv_model_thinking_tools(monkeypatch):

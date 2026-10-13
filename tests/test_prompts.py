@@ -4,7 +4,24 @@ from __future__ import annotations
 
 import pytest
 
-from agent.prompts import PromptLibrary
+from agent.prompts import PromptLibrary, load_prompt
+
+
+def test_load_prompt_reads_markdown_file(tmp_path):
+    path = tmp_path / "instructions.md"
+    path.write_text("  Do the thing.\n\n", encoding="utf-8")
+    assert load_prompt(path) == "Do the thing."
+
+
+def test_load_prompt_accepts_str_path(tmp_path):
+    path = tmp_path / "instructions.md"
+    path.write_text("hello", encoding="utf-8")
+    assert load_prompt(str(path)) == "hello"
+
+
+def test_load_prompt_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_prompt(tmp_path / "nope.md")
 
 
 @pytest.fixture
