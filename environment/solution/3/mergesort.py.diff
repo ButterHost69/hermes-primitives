@@ -1,0 +1,13 @@
+diff --git a/mergesort.py b/mergesort.py
+index 6e77662..42b76e6 100755
+--- a/mergesort.py
++++ b/mergesort.py
+@@ -12,6 +12,8 @@ def merge(left: list, right: list) -> list:
+         else:
+             result.append(right[j])
+             j += 1
++    result.extend(left[i:])
++    result.extend(right[j:])
+     return result
+ 
+ 
