@@ -15,6 +15,7 @@ KIND_ROLE = "role"
 KIND_INFO = "info"
 KIND_ERROR = "error"
 KIND_RESULT = "result"
+KIND_SPACER = "spacer"
 
 
 class Transcript:
@@ -27,7 +28,7 @@ class Transcript:
         self._pending_kind = KIND_TEXT
 
     def _append(self, kind: str, text: str) -> None:
-        if text == "":
+        if text == "" and kind != KIND_SPACER:
             return
         self.lines.append((kind, text))
         overflow = len(self.lines) - self.max_lines
@@ -58,15 +59,29 @@ class Transcript:
             self._append(KIND_THINKING, line)
 
     # -- markers --------------------------------------------------------- #
-    def tool(self, text: str) -> None:
-        """Add a tool-activity line, flushing any partial text first."""
+    def spacer(self) -> None:
+        """Add a blank separator line."""
         self._flush()
+        self._append(KIND_SPACER, "")
+
+    def tool(self, text: str) -> None:
+        """Add a tool-activity line, flushing any partial text first.
+
+        A blank line is inserted before the first tool in a run so tool
+        activity is visually separated from surrounding assistant text.
+        """
+        self._flush()
+        if self.lines and self.lines[-1][0] not in (KIND_SPACER, KIND_TOOL):
+            self.spacer()
         self._append(KIND_TOOL, text)
 
     def role(self, text: str) -> None:
-        """Add a role banner line, flushing any partial text first."""
+        """Add a role banner, separated from adjacent content by blank lines."""
         self._flush()
+        if self.lines:
+            self.spacer()
         self._append(KIND_ROLE, text)
+        self.spacer()
 
     def extend_last(self, text: str) -> None:
         """Append ``text`` to the most recent line (for tool completion)."""
@@ -80,10 +95,12 @@ class Transcript:
 
     def error(self, text: str) -> None:
         self._flush()
+        self.spacer()
         self._append(KIND_ERROR, text)
 
     def result(self, text: str) -> None:
         self._flush()
+        self.spacer()
         self._append(KIND_RESULT, text)
 
     def settle(self) -> None:

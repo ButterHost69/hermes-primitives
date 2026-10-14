@@ -229,4 +229,8 @@ class Terminal:
             return "END"
         if seq in (b"3~",):
             return "DELETE"
+        if seq in (b"5~",):
+            return "PAGE_UP"
+        if seq in (b"6~",):
+            return "PAGE_DOWN"
         return None

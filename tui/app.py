@@ -22,6 +22,7 @@ from .transcript import (
     KIND_INFO,
     KIND_RESULT,
     KIND_ROLE,
+    KIND_SPACER,
     KIND_THINKING,
     KIND_TOOL,
     Transcript,
@@ -75,6 +76,12 @@ class PipelineApp:
         self._worker: threading.Thread | None = None
         self._quit_requested = False
         self.done = False
+
+        # Scrolling state: ``_scroll_offset`` is how many lines the view is
+        # scrolled up from the bottom (0 = pinned to the latest output).
+        self._scroll_offset = 0
+        self._auto_scroll = True
+        self._total_lines = 0
 
         # Route streaming records from every role's Pi subprocess here.
         pipeline.observer = self._observer
@@ -177,6 +184,8 @@ class PipelineApp:
         self.current_role = self.role_names[index]
         self.phase = "running"
         self.elapsed_start = time.monotonic()
+        self._scroll_offset = 0
+        self._auto_scroll = True
         self.transcript.role(f"\u25b6 {self.current_role}")
         self._role_done = None
         self._role_done_event = threading.Event()
@@ -230,15 +239,45 @@ class PipelineApp:
     # Input handling
     # ------------------------------------------------------------------ #
     def _handle_key(self, key: str) -> None:
+        if key in ("UP", "DOWN", "PAGE_UP", "PAGE_DOWN"):
+            self._scroll(key)
+            return
         if self.phase in ("input", "between"):
             self._edit_input(key)
         elif self.phase == "running":
             if key == CTRL_C:
                 self._quit_requested = True
                 self.transcript.info("[will quit after this role finishes]")
+            elif key in ("HOME", "END"):
+                self._scroll(key)
         elif self.phase == "done":
             if key in ENTER_KEYS or key in ("q", "Q", CTRL_C, CTRL_D):
                 self.done = True
+            elif key in ("HOME", "END"):
+                self._scroll(key)
+
+    def _scroll(self, key: str) -> None:
+        """Adjust the transcript scroll offset.
+
+        UP/DOWN move one line; PAGE_UP/PAGE_DOWN move a full body; HOME jumps
+        to the top and END re-pins to the latest output.
+        """
+        body_height = max(1, self.term.size()[1] - 7)
+        step = body_height if key in ("PAGE_UP", "PAGE_DOWN") else 1
+
+        if key in ("UP", "PAGE_UP"):
+            self._scroll_offset += step
+            self._auto_scroll = False
+        elif key in ("DOWN", "PAGE_DOWN"):
+            self._scroll_offset = max(0, self._scroll_offset - step)
+            if self._scroll_offset == 0:
+                self._auto_scroll = True
+        elif key == "HOME":
+            self._scroll_offset = max(0, self._total_lines - body_height)
+            self._auto_scroll = False
+        elif key == "END":
+            self._scroll_offset = 0
+            self._auto_scroll = True
 
     def _edit_input(self, key: str) -> None:
         if key in ENTER_KEYS:
@@ -263,7 +302,7 @@ class PipelineApp:
             self.input_cursor = len(self.input_line)
         elif key == "DELETE":
             self._delete_forward()
-        elif key in ("UP", "DOWN", "ESC"):
+        elif key == "ESC":
             return
         elif len(key) == 1 and key.isprintable():
             self.input_line = (
@@ -328,27 +367,34 @@ class PipelineApp:
             meta += f" \u00b7 role {self.role_index + 1}/{len(self.role_names)}"
         return title + self.theme.style(meta, fg="muted")
 
-    def _body_chunks(self, width: int, height: int) -> list[tuple[str, str]]:
-        display: list[tuple[str, str]] = []
-        for kind, text in reversed(self.transcript.lines):
-            for chunk in reversed(wrap_text(text, width)):
-                display.append((kind, chunk))
-                if len(display) >= height:
-                    break
-            if len(display) >= height:
-                break
+    def _wrap_kind(self, kind: str, text: str, width: int) -> list[str]:
+        """Wrap one transcript line to ``width``, indenting tool lines."""
+        if kind == KIND_TOOL:
+            return ["  " + chunk for chunk in wrap_text(text, max(1, width - 2))]
+        return wrap_text(text, width)
 
-        if len(display) < height:
-            kind, pending = self.transcript.partial()
-            if pending:
-                for chunk in reversed(wrap_text(pending, width)):
-                    display.append((kind, chunk))
-                    if len(display) >= height:
-                        break
-        display.reverse()
+    def _display(self, width: int) -> list[tuple[str, str]]:
+        """Build the full wrapped transcript, oldest first, pending included."""
+        display: list[tuple[str, str]] = []
+        for kind, text in self.transcript.lines:
+            display.extend((kind, chunk) for chunk in self._wrap_kind(kind, text, width))
+        kind, pending = self.transcript.partial()
+        if pending:
+            display.extend((kind, chunk) for chunk in self._wrap_kind(kind, pending, width))
         return display
 
+    def _visible(self, display: list[tuple[str, str]], height: int) -> list[tuple[str, str]]:
+        """Slice the scrolled window of ``height`` lines out of ``display``."""
+        offset = self._scroll_offset
+        if offset <= 0:
+            return display[-height:]
+        end = max(0, len(display) - offset)
+        start = max(0, end - height)
+        return display[start:end]
+
     def _style_line(self, kind: str, text: str) -> str:
+        if kind == KIND_SPACER:
+            return ""
         if kind == KIND_ROLE:
             return self.theme.style(text, fg="accent", bold=True)
         if kind == KIND_THINKING:
@@ -363,6 +409,8 @@ class PipelineApp:
 
     def _phase_hint(self) -> str:
         if self.phase == "running":
+            if self._scroll_offset > 0:
+                return "\u2191 scrolled \u2014 press End to follow"
             return ""
         if self.phase == "done":
             return "press q or Enter to quit"
@@ -370,24 +418,29 @@ class PipelineApp:
 
     def _status_content(self) -> str:
         if self.phase == "input":
-            return self.theme.style(
+            base = self.theme.style(
                 "\u25cf  enter the bug report, then press Enter", fg="accent"
             )
-        if self.phase == "running":
+        elif self.phase == "running":
             spinner = _SPINNER[self._tick % len(_SPINNER)]
             elapsed = time.monotonic() - (self.elapsed_start or time.monotonic())
-            return self.theme.style(
+            base = self.theme.style(
                 f"{spinner}  running {self.current_role} \u00b7 {elapsed:.1f}s",
                 fg="warning",
             )
-        if self.phase == "between":
-            return self.theme.style(
+        elif self.phase == "between":
+            base = self.theme.style(
                 "\u25cf  Enter to continue, type to add context, or /quit",
                 fg="success",
             )
-        if self.error is not None:
-            return self.theme.style(f"\u2717  {self.error}", fg="error")
-        return self.theme.style("\u2713  pipeline complete", fg="success")
+        elif self.error is not None:
+            base = self.theme.style(f"\u2717  {self.error}", fg="error")
+        else:
+            base = self.theme.style("\u2713  pipeline complete", fg="success")
+
+        if self._scroll_offset > 0:
+            base += self.theme.style("  \u00b7 \u2191 scrolled", fg="dim")
+        return base
 
     def _prompt_content(self) -> str:
         prefix = self.theme.style("\u203a ", fg="accent", bold=True)
@@ -397,13 +450,20 @@ class PipelineApp:
     def _build_frame(self) -> tuple[list[str], tuple[int, int] | None]:
         width, height = self.term.size()
         body_height = max(1, height - 7)
+        body_width = width - 4
+
+        display = self._display(body_width)
+        self._total_lines = len(display)
+        max_offset = max(0, self._total_lines - body_height)
+        if self._scroll_offset > max_offset:
+            self._scroll_offset = max_offset
 
         lines: list[str] = []
         lines.append(self._rule("\u256d", "\u256e"))
         lines.append(self._row(self._header_content()))
         lines.append(self._rule("\u251c", "\u2524"))
 
-        for kind, chunk in self._body_chunks(width - 4, body_height):
+        for kind, chunk in self._visible(display, body_height):
             lines.append(self._row(self._style_line(kind, chunk)))
         while len(lines) < 3 + body_height:
             lines.append(self._row(""))
