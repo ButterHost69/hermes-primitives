@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from agent import PiError, PiSession, load_prompt
+from agent import PiError, load_prompt
 from agent.gated_client import GatedPiSession, Policy
 from agent.tools import BUILTIN_TOOLS
 
@@ -85,29 +85,59 @@ class Primitive:
 
     ``source_file`` is a filesystem path.  ``dep_files`` maps each related
     file to its relationship with this unit and is empty when no
-    relationships are known.  ``session`` is the Pi session the primitive
-    reuses across objectives: the role opens it on first use and it stays
-    attached until :meth:`close` is called.
+    relationships are known.  ``model``, ``thinking``, ``cwd``, and
+    ``observer`` configure the gated Pi session the primitive drives, and
+    ``session`` is that session: it is opened when the primitive is created
+    and stays attached for every later objective until :meth:`close` is
+    called.
     """
 
     source_file: str
     dep_files: dict[str, str] = field(default_factory=dict)
-    session: PiSession | None = None
+    model: str | None = None
+    thinking: str | None = None
+    cwd: str | None = None
+    observer: Callable[[dict[str, Any]], None] | None = field(
+        default=None, repr=False
+    )
+    session: GatedPiSession | None = field(init=False, compare=False, repr=False)
 
-    def attach_session(self, session: PiSession) -> None:
-        """Attach the Pi session this primitive reuses for its objectives.
+    def __post_init__(self) -> None:
+        """Open the gated Pi session this primitive drives.
 
-        A primitive outlives a single objective: it keeps one Pi subprocess
-        attached and reuses it for every later modification instead of
-        spawning a new one per role call.  Re-attaching a different session
-        closes the previous one so no subprocess is leaked.
+        The session is gated: the model is told to touch nothing outside its
+        own artifact, and the gate makes that true -- a ``write`` or ``edit``
+        anywhere else is blocked before it runs.  Every other tool, including
+        bash, stays available because the primitive has to reason about the
+        system and run what it changed.
         """
-        if self.session is not None and self.session is not session:
-            self.session.close()
-        self.session = session
+        self.session = GatedPiSession(
+            tools=ALL_TOOLS,
+            model=self.model,
+            thinking=self.thinking,
+            cwd=self.cwd,
+            observer=self.observer,
+            policy=writes_only_to(self.source_file, self.cwd),
+        )
+
+    def run(self, issue: str) -> str:
+        """Apply ``issue`` to this code unit and return the assistant's report.
+
+        ``issue`` is the objective the primitive must reason about; it is sent
+        to the model together with the dependency relationships that bound
+        this unit.  The session opened at construction is reused for every
+        objective, so ``model``, ``thinking``, ``cwd``, and ``observer`` were
+        fixed there and apply to this and every later run.  The session is
+        gated by :func:`writes_only_to`, so only ``write`` and ``edit`` against
+        ``source_file`` can run.
+        """
+        if self.session is None:
+            raise PiError(f"this primitive is closed: {self.source_file}")
+        prompt = load_prompt(PROMPTS_DIR / "primitive.md")
+        return self.session.run(f"{prompt}\n\n{_briefing(issue, self)}")
 
     def close(self) -> None:
-        """Close the attached Pi session; the next objective opens a new one."""
+        """Close the attached Pi session; the primitive cannot run afterwards."""
         if self.session is not None:
             self.session.close()
             self.session = None
@@ -134,65 +164,6 @@ def _briefing(issue: str, target: Primitive) -> str:
         issue,
     ]
     return "\n".join(lines)
-
-
-def _session_for(
-    target: Primitive,
-    *,
-    model: str | None,
-    thinking: str | None,
-    cwd: str | None,
-    observer: Callable[[dict[str, Any]], None] | None,
-) -> PiSession:
-    """Return the primitive's Pi session, opening it on first use.
-
-    The session is gated: the model is told to touch nothing outside its own
-    artifact, and the gate makes that true -- a ``write`` or ``edit`` anywhere
-    else is blocked before it runs.  Every other tool, including bash, stays
-    available because the primitive has to reason about the system and run
-    what it changed.
-    """
-    if target.session is None:
-        target.attach_session(
-            GatedPiSession(
-                tools=ALL_TOOLS,
-                model=model,
-                thinking=thinking,
-                cwd=cwd,
-                observer=observer,
-                policy=writes_only_to(target.source_file, cwd),
-            )
-        )
-    return target.session
-
-
-def primitive(
-    issue: str,
-    target: Primitive,
-    *,
-    model: str | None = None,
-    thinking: str | None = None,
-    cwd: str | None = None,
-    observer: Callable[[dict[str, Any]], None] | None = None,
-) -> str:
-    """Apply ``issue`` to one code unit and return the assistant's report.
-
-    ``issue`` is the objective the primitive must reason about; ``target`` is
-    the unit itself, sent to the model together with its dependency
-    relationships.  The Pi session stays attached to ``target`` so later
-    objectives on the same primitive reuse it: ``model``, ``thinking``,
-    ``cwd``, and ``observer`` only apply when that session is first opened.
-    ``observer``, when given, is registered on the session's RPC client as an
-    extra event listener so callers can stream progress without changing the
-    synchronous request/response contract.  The session is gated by
-    :func:`writes_only_to`, so only ``write`` and ``edit`` against
-    ``target.source_file`` can run.
-    """
-    prompt = load_prompt(PROMPTS_DIR / "primitive.md")
-    session = _session_for(
-        target, model=model, thinking=thinking, cwd=cwd, observer=observer
-    )
-    return session.run(f"{prompt}\n\n{_briefing(issue, target)}")
 
 
 def _parse_dep(value: str) -> tuple[str, str]:
@@ -246,16 +217,13 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     text = args.text if args.text is not None else sys.stdin.read()
     try:
-        result = primitive(
-            text,
-            Primitive(
-                source_file=args.file,
-                dep_files=dict(_parse_dep(value) for value in args.dep),
-            ),
+        result = Primitive(
+            source_file=args.file,
+            dep_files=dict(_parse_dep(value) for value in args.dep),
             model=args.model,
             thinking=args.thinking,
             cwd=args.cwd,
-        )
+        ).run(text)
     except PiError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

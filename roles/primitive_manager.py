@@ -11,16 +11,17 @@ class PrimitiveManager:
     def __init__(self) -> None:
         self.primitive_map: dict[str, Primitive] = {}
 
-    def create(
-        self,
-        source_file: str,
-        dep_files: dict[str, str] | None = None,
-    ) -> Primitive:
-        """Create a Primitive, register it under ``source_file``, return it."""
-        primitive = Primitive(
-            source_file=source_file,
-            dep_files=dep_files if dep_files is not None else {},
-        )
+    def create(self, source_file: str) -> Primitive:
+        """Create a Primitive, register it under ``source_file``, return it.
+
+        A Primitive already registered under ``source_file`` is returned as it
+        is: registering a fresh one would drop the Pi session it has attached
+        and the dependency relationships it has accumulated.
+        """
+        registered = self.primitive_map.get(source_file)
+        if registered is not None:
+            return registered
+        primitive = Primitive(source_file=source_file)
         self.primitive_map[source_file] = primitive
         return primitive
 

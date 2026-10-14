@@ -51,25 +51,30 @@ def stubs(monkeypatch):
         sessions.append(session)
         return session
 
-    # The primitive now opens a gated session; patch the constructor it calls.
+    # The primitive opens its gated session when it is created; patch the
+    # constructor it calls.
     monkeypatch.setattr(primitive_module, "GatedPiSession", make_session)
-    monkeypatch.setattr(primitive_module, "PiSession", make_session)
     return {"sessions": sessions, "outputs": outputs}
 
 
-def test_primitive_fields():
+def test_primitive_fields(stubs):
     assert [f.name for f in fields(Primitive)] == [
         "source_file",
         "dep_files",
+        "model",
+        "thinking",
+        "cwd",
+        "observer",
         "session",
     ]
-    assert Primitive("a.py").dep_files == {}
-    assert Primitive("a.py").session is None
+    target = Primitive("a.py")
+    assert target.dep_files == {}
+    assert target.session is not None
 
 
 def test_primitive_grants_all_tools(stubs):
     stubs["outputs"].append("report")
-    primitive_module.primitive("fix it", Primitive("a.py"))
+    Primitive("a.py").run("fix it")
 
     session = stubs["sessions"][0]
     assert session.kwargs["tools"] == primitive_module.ALL_TOOLS
@@ -84,19 +89,20 @@ def test_primitive_sends_prompt_and_briefing(stubs):
     target = Primitive(
         source_file="src/app.py",
         dep_files={"src/db.py": "reads its settings"},
+        model="claude",
+        thinking="low",
+        cwd="/tmp/x",
     )
     stubs["outputs"].append("fixed the loop")
 
-    result = primitive_module.primitive(
-        "fix the crash", target, model="claude", thinking="low", cwd="/tmp/x"
-    )
+    result = target.run("fix the crash")
 
     assert result == "fixed the loop"
-    session = stubs["sessions"][0]
-    # The session stays attached and open: the primitive reuses it for later
-    # objectives instead of spawning a Pi subprocess per call.
+    # The session created with the primitive stays open: the primitive reuses
+    # it for later objectives instead of spawning a Pi subprocess per run.
+    session = target.session
+    assert session is stubs["sessions"][0]
     assert session.closed is False
-    assert target.session is session
     assert session.kwargs["model"] == "claude"
     assert session.kwargs["thinking"] == "low"
     assert session.kwargs["cwd"] == "/tmp/x"
@@ -112,64 +118,41 @@ def test_primitive_sends_prompt_and_briefing(stubs):
 
 def test_primitive_briefing_without_dependencies(stubs):
     stubs["outputs"].append("no change needed")
-    primitive_module.primitive("tidy it", Primitive("solo.py"))
+    Primitive("solo.py").run("tidy it")
 
     message = stubs["sessions"][0].run_calls[0]
     assert "Component under change: solo.py" in message
     assert "- no related components are known" in message
 
 
-def test_primitive_reuses_attached_session(stubs):
+def test_primitive_reuses_one_session_across_objectives(stubs):
     target = Primitive("a.py")
     stubs["outputs"].extend(["first", "second"])
 
-    first = primitive_module.primitive("objective one", target)
-    second = primitive_module.primitive("objective two", target)
+    first = target.run("objective one")
+    second = target.run("objective two")
 
     assert (first, second) == ("first", "second")
-    # One session for the whole primitive: re-run reuses the attached one
-    # instead of spawning a second Pi subprocess.
+    # One session for the whole primitive: the second run reuses the one
+    # opened at construction instead of spawning another Pi subprocess.
     assert len(stubs["sessions"]) == 1
-    session = stubs["sessions"][0]
-    assert target.session is session
+    session = target.session
     assert session.closed is False
     assert len(session.run_calls) == 2
     assert "objective one" in session.run_calls[0]
     assert "objective two" in session.run_calls[1]
 
 
-def test_primitive_reopens_session_after_close(stubs):
+def test_close_closes_the_session_and_blocks_later_runs(stubs):
     target = Primitive("a.py")
-    stubs["outputs"].extend(["first", "second"])
+    session = target.session
 
-    primitive_module.primitive("objective one", target)
-    first_session = target.session
     target.close()
-    assert first_session.closed is True
+
+    assert session.closed is True
     assert target.session is None
-
-    primitive_module.primitive("objective two", target)
-    assert len(stubs["sessions"]) == 2
-    assert target.session is not first_session
-
-
-def test_attach_session_replaces_and_closes_previous(stubs):
-    target = Primitive("a.py")
-    first = StubSession([])
-    second = StubSession([])
-
-    target.attach_session(first)
-    target.attach_session(second)
-
-    assert first.closed is True
-    assert target.session is second
-    # Re-attaching the same session is a no-op, not a close.
-    target.attach_session(second)
-    assert second.closed is False
-
-
-def test_close_without_session_is_noop():
-    Primitive("a.py").close()
+    with pytest.raises(PiError):
+        target.run("objective")
 
 
 def test_primitive_forwards_observer(stubs):
@@ -179,15 +162,15 @@ def test_primitive_forwards_observer(stubs):
         seen.append(record)
 
     stubs["outputs"].append("report")
-    primitive_module.primitive("fix it", Primitive("a.py"), observer=observer)
+    Primitive("a.py", observer=observer).run("fix it")
     assert stubs["sessions"][0].kwargs["observer"] is observer
 
 
-def test_main_error_exits_nonzero(monkeypatch, capsys):
-    def boom(issue, target, *, model=None, thinking=None, cwd=None, observer=None):
+def test_main_error_exits_nonzero(monkeypatch, capsys, stubs):
+    def boom(self, issue):
         raise PiError("nope")
 
-    monkeypatch.setattr(primitive_module, "primitive", boom)
+    monkeypatch.setattr(primitive_module.Primitive, "run", boom)
     with pytest.raises(SystemExit) as exc:
         primitive_module.main(["objective", "--file", "a.py"])
     assert exc.value.code == 1
@@ -246,15 +229,15 @@ def test_build_parser_requires_file():
         primitive_module.build_parser().parse_args([])
 
 
-def test_main_parses_target_and_prints_report(monkeypatch, capsys):
+def test_main_parses_target_and_prints_report(monkeypatch, capsys, stubs):
     seen: dict = {}
 
-    def fake(issue, target, *, model=None, thinking=None, cwd=None, observer=None):
+    def fake(self, issue):
         seen["issue"] = issue
-        seen["target"] = target
+        seen["target"] = self
         return "the report"
 
-    monkeypatch.setattr(primitive_module, "primitive", fake)
+    monkeypatch.setattr(primitive_module.Primitive, "run", fake)
     primitive_module.main(
         ["fix the crash", "--file", "src/app.py", "--dep", "src/db.py=reads it"]
     )
@@ -264,14 +247,14 @@ def test_main_parses_target_and_prints_report(monkeypatch, capsys):
     assert "the report" in capsys.readouterr().out
 
 
-def test_main_reads_stdin_when_text_omitted(monkeypatch, capsys):
+def test_main_reads_stdin_when_text_omitted(monkeypatch, capsys, stubs):
     seen: dict = {}
 
-    def fake(issue, target, *, model=None, thinking=None, cwd=None, observer=None):
+    def fake(self, issue):
         seen["issue"] = issue
         return "done"
 
-    monkeypatch.setattr(primitive_module, "primitive", fake)
+    monkeypatch.setattr(primitive_module.Primitive, "run", fake)
     monkeypatch.setattr(sys, "stdin", io.StringIO("from stdin"))
     primitive_module.main(["--file", "a.py"])
     assert seen["issue"] == "from stdin"
@@ -289,8 +272,7 @@ def _request(tool: str, path=None, cwd: str = "/repo") -> dict:
 
 
 def test_primitive_opens_a_gated_session(stubs):
-    stubs["outputs"].append("report")
-    primitive_module.primitive("fix it", Primitive("src/app.py"), cwd="/repo")
+    Primitive("src/app.py", cwd="/repo")
 
     session = stubs["sessions"][0]
     assert session.kwargs["tools"] == primitive_module.ALL_TOOLS
@@ -404,7 +386,7 @@ def test_primitive_blocks_a_write_to_a_dependency(gate_pi, tmp_path, monkeypatch
         dep_files={"src/db.py": "reads its settings"},
     )
     # the real gated session, over the fake pi's gate protocol
-    report = primitive_module.primitive("fix it", target, cwd=str(tmp_path))
+    report = target.run("fix it")
 
     assert target.session is not None
     assert verdicts, "the policy was never consulted"
@@ -415,13 +397,13 @@ def test_primitive_blocks_a_write_to_a_dependency(gate_pi, tmp_path, monkeypatch
 
 def test_primitive_from_the_manager_is_gated(stubs):
     """A Primitive obtained through the registry is gated the same way."""
-    from primitives import PrimitiveManager
+    from roles.primitive_manager import PrimitiveManager
 
     manager = PrimitiveManager()
-    target = manager.create("src/app.py", {"src/db.py": "reads its settings"})
+    target = manager.create("src/app.py")
     stubs["outputs"].append("report")
 
-    primitive_module.primitive("fix it", target, cwd="/repo")
+    target.run("fix it")
 
     session = stubs["sessions"][0]
     assert session.kwargs["policy"] is not None

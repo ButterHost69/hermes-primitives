@@ -116,9 +116,6 @@ roles/
     ├── primitive.md # the primitive prompt template
     └── reproduce.md # the reproduce prompt template
 
-primitives/
-├── __init__.py     # re-exports Primitive (from roles.primitive) and the manager
-└── manager.py      # PrimitiveManager: registry of primitives keyed by source_file
 
 utils/
 ├── json_utils.py   # verify_json(): check model output is valid JSON
@@ -189,8 +186,9 @@ requires.  The unit of work is a `Primitive` (defined in
 `roles/primitive.py`): the `source_file` it owns plus the `dep_files` mapping
 that records the relationships bounding it.  A `Primitive` keeps one Pi session
 attached and reuses it across objectives, so a second modification on the same
-unit does not spawn a new subprocess; `primitives.PrimitiveManager` holds the
-registry of primitives keyed by source file.  The role returns the assistant's
+unit does not spawn a new subprocess; `roles.primitive_manager.PrimitiveManager`
+holds the registry of primitives keyed by source file.  The role returns the
+assistant's
 report: the modification applied, or the explicit statement that no local
 change was necessary.
 
