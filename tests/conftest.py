@@ -249,3 +249,111 @@ class FakeReadline:
 @pytest.fixture
 def fake_client():
     return FakeClient()
+
+
+# --------------------------------------------------------------------------- #
+# Fake `pi` that speaks the tool-gate protocol
+#
+# `gate_probe` stands in for the tool-gate extension: it raises an `input`
+# dialog and waits for the client's answer, exactly as Pi does for
+# `ctx.ui.input()` inside a `tool_call` handler.  `gate_probe_pending` records
+# whatever arrives instead of answering, for the close() path.  On `prompt` the
+# fake raises one gate dialog built from `HMS_TEST_GATE_REQUEST` (a JSON
+# request) before streaming the turn, so role-level tests decide real requests.
+# --------------------------------------------------------------------------- #
+_GATE_FAKE_PI_BODY = r'''
+import json
+import os
+import sys
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def respond(cmd, success=True, data=None):
+    record = {"type": "response", "command": cmd.get("type"), "success": success}
+    if cmd.get("id") is not None:
+        record["id"] = cmd["id"]
+    if data is not None:
+        record["data"] = data
+    out(record)
+
+
+def dialog(cmd):
+    out({"type": "extension_ui_request", "id": cmd["id"], "method": "input",
+         "title": cmd.get("title", "hms-tool-gate"),
+         "placeholder": cmd.get("placeholder", "{}")})
+
+
+DEFAULT_GATE_REQUEST = json.dumps(
+    {"v": 1, "toolName": "bash", "toolCallId": "t1", "cwd": os.getcwd(),
+     "input": {"command": "ls"}}
+)
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    try:
+        cmd = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    t = cmd.get("type")
+
+    if t == "gate_probe":
+        dialog(cmd)
+        while True:
+            reply = sys.stdin.readline()
+            if not reply:
+                break
+            try:
+                msg = json.loads(reply)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("type") == "extension_ui_response" and msg.get("id") == cmd["id"]:
+                respond(cmd, True, {"verdict": msg.get("value"),
+                                    "cancelled": msg.get("cancelled")})
+                break
+    elif t == "gate_probe_pending":
+        dialog(cmd)
+        reply = sys.stdin.readline()
+        msg = json.loads(reply) if reply.strip() else {"eof": True}
+        with open(cmd["record_path"], "w") as handle:
+            json.dump(msg, handle)
+    elif t == "prompt":
+        respond(cmd, True, {"disposition": "started"})
+        out({"type": "agent_start"})
+        # One gated tool call inside the turn, then the turn's text.
+        out({"type": "extension_ui_request", "id": cmd["id"] + "-gate",
+             "method": "input", "title": "hms-tool-gate",
+             "placeholder": os.environ.get("HMS_TEST_GATE_REQUEST",
+                                           DEFAULT_GATE_REQUEST)})
+        sys.stdin.readline()  # the verdict; the turn waits for it
+        for ch in cmd.get("message", ""):
+            out({"type": "message_update", "usage": {},
+                 "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0,
+                                           "delta": ch}})
+        out({"type": "message_end", "message": {"role": "assistant",
+              "content": [{"type": "text", "text": cmd.get("message", "")}]}})
+        out({"type": "agent_settled", "aborted": False})
+    elif t == "get_state":
+        respond(cmd, True, {"sessionId": "gate-session"})
+    elif t == "die":
+        respond(cmd, True, {"bye": True})
+        break
+    else:
+        respond(cmd, True, {})
+'''
+
+
+@pytest.fixture
+def gate_pi(tmp_path, monkeypatch):
+    """Put a gate-protocol fake `pi` at the front of PATH and return its path."""
+    script = tmp_path / "pi"
+    script.write_text("#!" + sys.executable + "\n" + _GATE_FAKE_PI_BODY)
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.delenv("HMS_TEST_GATE_REQUEST", raising=False)
+    return str(script)

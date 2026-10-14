@@ -4,10 +4,10 @@ A :class:`Primitive` is a source file plus the dependency relationships that
 bound it.  This is the first role that *changes* the codebase, so unlike the
 read-only roles it receives every tool Pi offers — read, grep, find, and ls to
 reason about the system, write and edit to apply the local modification, and
-bash to run what it changed.  The model is instructed to touch nothing
-outside the primitive's own artifact.  The role returns the assistant's final
-report: the modification it applied, or the explicit statement that no local
-change was necessary.
+bash to run what it changed.  The run goes through a gated Pi session whose
+policy allows ``write`` and ``edit`` only against the primitive's own
+artifact.  The role returns the assistant's final report: the modification it
+applied, or the explicit statement that no local change was necessary.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import PiError, PiSession, load_prompt
+from agent.gated_client import GatedPiSession, Policy
 from agent.tools import BUILTIN_TOOLS
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -26,6 +27,56 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # The primitive applies the change itself, so it keeps the whole tool catalog:
 # reproduction and diagnosis stay read-only, a modification is not.
 ALL_TOOLS = tuple(tool.name for tool in BUILTIN_TOOLS)
+
+# The only tools that change the working tree directly.  Everything else —
+# read, grep, find, ls, and the bash the primitive runs what it changed with —
+# is allowed without a decision.
+WRITE_TOOLS = ("write", "edit")
+
+
+def _resolve_path(path: str, cwd: str | None) -> Path:
+    """Resolve ``path`` the way Pi's file tools resolve their arguments."""
+    candidate = Path(path)
+    if cwd is not None and not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    return candidate.resolve()
+
+
+def writes_only_to(source_file: str, cwd: str | None = None) -> Policy:
+    """Build a primitive's policy: write and edit only its own artifact.
+
+    Requests for every other tool are allowed immediately.  A ``write`` or
+    ``edit`` is compared against ``source_file`` after both sides are resolved
+    against the session's working directory, so relative paths, ``..``
+    segments, and symlinks cannot name another artifact.  A write without a
+    usable path is blocked: an unverifiable target is not an allowed one.
+
+    The gate fences the write and edit tools.  A bash command can still change
+    another file, so confinement beyond that is the operating system's job.
+    """
+
+    def policy(request: dict[str, Any]) -> dict[str, Any]:
+        if request.get("toolName") not in WRITE_TOOLS:
+            return {"action": "allow"}
+        arguments = request.get("input")
+        path = arguments.get("path") if isinstance(arguments, dict) else None
+        if not isinstance(path, str):
+            return {
+                "action": "block",
+                "reason": "primitive gate: a write without a path cannot be verified",
+            }
+        base = request.get("cwd") or cwd
+        if _resolve_path(path, base) == _resolve_path(source_file, base):
+            return {"action": "allow"}
+        return {
+            "action": "block",
+            "reason": (
+                f"primitive gate: this primitive may only write {source_file}; "
+                f"{path} is another artifact"
+            ),
+        }
+
+    return policy
 
 
 @dataclass
@@ -93,15 +144,23 @@ def _session_for(
     cwd: str | None,
     observer: Callable[[dict[str, Any]], None] | None,
 ) -> PiSession:
-    """Return the primitive's Pi session, opening it on first use."""
+    """Return the primitive's Pi session, opening it on first use.
+
+    The session is gated: the model is told to touch nothing outside its own
+    artifact, and the gate makes that true -- a ``write`` or ``edit`` anywhere
+    else is blocked before it runs.  Every other tool, including bash, stays
+    available because the primitive has to reason about the system and run
+    what it changed.
+    """
     if target.session is None:
         target.attach_session(
-            PiSession(
+            GatedPiSession(
                 tools=ALL_TOOLS,
                 model=model,
                 thinking=thinking,
                 cwd=cwd,
                 observer=observer,
+                policy=writes_only_to(target.source_file, cwd),
             )
         )
     return target.session
@@ -125,7 +184,9 @@ def primitive(
     ``cwd``, and ``observer`` only apply when that session is first opened.
     ``observer``, when given, is registered on the session's RPC client as an
     extra event listener so callers can stream progress without changing the
-    synchronous request/response contract.
+    synchronous request/response contract.  The session is gated by
+    :func:`writes_only_to`, so only ``write`` and ``edit`` against
+    ``target.source_file`` can run.
     """
     prompt = load_prompt(PROMPTS_DIR / "primitive.md")
     session = _session_for(

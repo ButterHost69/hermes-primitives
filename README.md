@@ -48,6 +48,50 @@ Sessions persist automatically under `.sessions/` in the working directory.
 Custom prompts are plain Markdown files stored in `agent/prompts/`, so you can
 edit them outside the interface too.
 
+## Gated client (optional)
+
+`agent/gated_client.py` adds a second client type — `PiClient` is untouched — for
+runs where a tool call must be approved *before* it executes.  It spawns the
+same `pi --mode rpc` subprocess with one addition: `--extension agent/tool_gate.js`.
+That extension intercepts Pi's `tool_call` event (the only pre-execution hook
+Pi offers) and asks the Python side for a verdict over Pi's extension-UI
+subprotocol, so the tool never runs until the policy answers:
+
+```
+pi  -> hms  {"type":"extension_ui_request","method":"input",
+             "title":"hms-tool-gate","placeholder":"<request JSON>"}
+hms -> pi   {"type":"extension_ui_response","id":"<same id>","value":"<verdict JSON>"}
+```
+
+A policy is any callable from request to verdict:
+
+```python
+from agent.gated_client import GatedPiSession
+
+def policy(request):
+    # request: {"v", "toolName", "toolCallId", "parentToolCallId"?,
+    #          "cwd", "input"}  — nested codemode calls carry parentToolCallId
+    if request["toolName"] == "write" and "/etc/" in request["input"]["path"]:
+        return {"action": "block", "reason": "system path"}
+    return {"action": "allow"}
+    # or {"action": "allow", "patch": {"command": "ls /repo"}}  to rewrite args
+
+with GatedPiSession(policy=policy, tools=["read", "bash", "edit", "write"]) as session:
+    text = session.run("fix the failing test")
+```
+
+The decision is made off the reader thread, so parallel tool calls do not
+serialize behind the policy.  It fails closed throughout: an exception, a
+non-object verdict, an unknown action, an undecodable request, a missing answer
+(`gate_timeout_ms`, default 30 s), or a subprocess that died mid-decision all
+block the call and hand the model the reason.  Patches are assigned onto the
+tool arguments without re-validation, so a `patch` must be schema-valid.
+
+Keep the policy fast — it runs for every call, before every tool, including the
+nested calls a `codemode` script makes.  A policy decides about *tools*; it
+does not confine the shell, so a `bash` call can still change a file the policy
+would have refused.  Containment beyond the policy is the operating system's job.
+
 ## Layout
 
 ```
@@ -56,6 +100,8 @@ agent/
 ├── interface.py    # interactive REPL and command controls
 ├── client.py       # JSONL RPC client for the Pi subprocess
 ├── session.py      # PiSession: owns its PiClient, synchronous request/response
+├── gated_client.py # GatedPiClient/GatedPiSession: policy-gated tool calls (optional)
+├── tool_gate.js    # Pi extension the gated client loads (jiti, no build step)
 ├── prompts.py      # custom prompt library + load_prompt()
 ├── tools.py        # built-in tool catalog and selection
 └── prompts/        # your saved prompts (.md files)
@@ -63,6 +109,7 @@ agent/
 roles/
 ├── diagnose.py     # diagnose an error trace into JSON findings + fixes (write tools disabled)
 ├── primitive.py    # modify one code unit toward an objective (all tools)
+├── primitive_manager.py # PrimitiveManager: registry of primitives keyed by source_file (drives no model, so it has no prompt)
 ├── reproduce.py    # reproduce a bug and confirm the error exists (write tools disabled)
 └── prompts/
     ├── diagnose.md # the diagnose prompt template
@@ -126,7 +173,16 @@ pi-primitive --file src/app.py --dep src/db.py="reads settings from here" < obje
 `primitive` is the first role that changes the codebase, so it runs Pi with
 *every* tool available — the read, search, and list tools to reason about the
 system, `write` and `edit` to apply the change, and `bash` to run what it
-changed.  It loads its prompt from `roles/prompts/primitive.md`, which asks the
+changed.  It is also the first role to run on the [gated client](#gated-client-optional),
+which makes the prompt's "modify only your own artifact" rule enforced rather
+than advisory: `writes_only_to(source_file)` builds the policy, so a `write` or
+`edit` aimed anywhere else is blocked before it executes with the reason
+"primitive gate: this primitive may only write …".  Every other tool, `bash`
+included, still runs without a decision — the gate fences the write tools, not
+the shell, so a command the model runs can still change another file and the
+assistant's report may claim an edit that was actually blocked.  Verify the
+tree (`git diff`) before trusting the report, and confine the shell itself
+with an operating-system boundary when that is required.  It loads its prompt from `roles/prompts/primitive.md`, which asks the
 model to reason about the objective within the primitive's dependency context
 and to modify only the portions of its own artifact that the objective
 requires.  The unit of work is a `Primitive` (defined in

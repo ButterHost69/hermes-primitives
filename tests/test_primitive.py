@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 from dataclasses import fields
+from pathlib import Path
 
 import pytest
 
 import roles.primitive as primitive_module
 from agent import PiError
 from agent.tools import BUILTIN_TOOLS
-from roles.primitive import Primitive
+from roles.primitive import Primitive, writes_only_to
 
 
 class StubSession:
@@ -49,6 +51,8 @@ def stubs(monkeypatch):
         sessions.append(session)
         return session
 
+    # The primitive now opens a gated session; patch the constructor it calls.
+    monkeypatch.setattr(primitive_module, "GatedPiSession", make_session)
     monkeypatch.setattr(primitive_module, "PiSession", make_session)
     return {"sessions": sessions, "outputs": outputs}
 
@@ -272,3 +276,157 @@ def test_main_reads_stdin_when_text_omitted(monkeypatch, capsys):
     primitive_module.main(["--file", "a.py"])
     assert seen["issue"] == "from stdin"
     assert "done" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# The write gate
+# --------------------------------------------------------------------------- #
+def _request(tool: str, path=None, cwd: str = "/repo") -> dict:
+    """A decision request as the tool-gate extension sends it."""
+    arguments = {} if path is None else {"path": path}
+    return {"v": 1, "toolName": tool, "toolCallId": "call_1", "cwd": cwd,
+            "input": arguments}
+
+
+def test_primitive_opens_a_gated_session(stubs):
+    stubs["outputs"].append("report")
+    primitive_module.primitive("fix it", Primitive("src/app.py"), cwd="/repo")
+
+    session = stubs["sessions"][0]
+    assert session.kwargs["tools"] == primitive_module.ALL_TOOLS
+    assert callable(session.kwargs["policy"])
+
+
+def test_gate_allows_every_tool_that_is_not_a_write():
+    policy = writes_only_to("src/app.py", "/repo")
+    for tool in ("read", "grep", "find", "ls", "bash", "codemode"):
+        assert policy(_request(tool, "src/other.py")) == {"action": "allow"}
+
+
+def test_gate_allows_write_to_the_source_file():
+    policy = writes_only_to("src/app.py", "/repo")
+    assert policy(_request("write", "src/app.py")) == {"action": "allow"}
+    assert policy(_request("edit", "src/app.py")) == {"action": "allow"}
+
+
+def test_gate_allows_write_to_the_source_file_by_absolute_path(tmp_path):
+    source = tmp_path / "src" / "app.py"
+    policy = writes_only_to(str(source), str(tmp_path))
+    assert policy(_request("write", str(source), cwd=str(tmp_path))) == {"action": "allow"}
+    # a relative spelling of the same file, and a traversal of it, both match
+    assert policy(_request("write", "app.py", cwd=str(source.parent))) == {"action": "allow"}
+    assert policy(_request("write", "src/../src/app.py", cwd=str(tmp_path))) == {
+        "action": "allow"
+    }
+
+
+def test_gate_blocks_write_to_any_other_file():
+    policy = writes_only_to("src/app.py", "/repo")
+    verdict = policy(_request("write", "src/db.py"))
+    assert verdict["action"] == "block"
+    assert "may only write src/app.py" in verdict["reason"]
+    assert "src/db.py" in verdict["reason"]
+    assert policy(_request("edit", "README.md"))["action"] == "block"
+
+
+def test_gate_blocks_absolute_paths_outside_the_source_file(tmp_path):
+    source = tmp_path / "src" / "app.py"
+    policy = writes_only_to(str(source), str(tmp_path))
+    other = tmp_path / "src" / "db.py"
+    assert policy(_request("edit", str(other), cwd=str(tmp_path)))["action"] == "block"
+
+
+def test_gate_blocks_a_write_without_a_usable_path():
+    policy = writes_only_to("src/app.py", "/repo")
+    assert policy(_request("write", None))["action"] == "block"
+    assert policy(_request("edit", 42))["action"] == "block"
+    assert policy({"toolName": "write", "cwd": "/repo", "input": "not-a-dict"})[
+        "action"
+    ] == "block"
+
+
+def test_gate_resolves_against_the_session_cwd_when_the_request_has_none():
+    policy = writes_only_to("app.py", "/repo")
+    # no cwd in the request: fall back to the session's cwd, same relative spelling
+    request = {"toolName": "write", "toolCallId": "c", "input": {"path": "app.py"}}
+    assert policy(request) == {"action": "allow"}
+    # the request's own cwd names the same base, so the same file still matches
+    assert policy(_request("write", "app.py", cwd="/repo")) == {"action": "allow"}
+    # another file in that base is still blocked
+    assert policy(_request("write", "other.py", cwd="/repo"))["action"] == "block"
+    # an absolute path elsewhere is blocked too
+    assert policy(_request("write", "/etc/hosts"))["action"] == "block"
+
+
+def test_gate_follows_symlinks(tmp_path):
+    real = tmp_path / "real" / "app.py"
+    real.parent.mkdir(parents=True)
+    real.write_text("x = 1\n")
+    link = tmp_path / "link.py"
+    link.symlink_to(real)
+    policy = writes_only_to("link.py", str(tmp_path))
+    # writing through the symlink still lands on the source file
+    assert policy(_request("write", "link.py", cwd=str(tmp_path))) == {"action": "allow"}
+
+
+def test_primitive_blocks_a_write_to_a_dependency(gate_pi, tmp_path, monkeypatch):
+    """End to end: the gate answers a write aimed at a dependency with a block."""
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("x = 1\n")
+    dependency = tmp_path / "src" / "db.py"
+    dependency.write_text("y = 2\n")
+
+    monkeypatch.setattr(primitive_module, "load_prompt", lambda path: "PROMPT")
+    monkeypatch.setenv(
+        "HMS_TEST_GATE_REQUEST",
+        json.dumps({"v": 1, "toolName": "edit", "toolCallId": "call_dep",
+                    "cwd": str(tmp_path), "input": {"path": "src/db.py"}}),
+    )
+
+    verdicts: list[dict] = []
+    original = primitive_module.writes_only_to
+
+    def spy(source_file, cwd=None):
+        policy = original(source_file, cwd)
+
+        def wrapped(request):
+            verdict = policy(request)
+            verdicts.append(verdict)
+            return verdict
+
+        return wrapped
+
+    monkeypatch.setattr(primitive_module, "writes_only_to", spy)
+
+    target = Primitive(
+        source_file="src/app.py",
+        dep_files={"src/db.py": "reads its settings"},
+    )
+    # the real gated session, over the fake pi's gate protocol
+    report = primitive_module.primitive("fix it", target, cwd=str(tmp_path))
+
+    assert target.session is not None
+    assert verdicts, "the policy was never consulted"
+    assert verdicts[0]["action"] == "block"
+    assert "may only write src/app.py" in verdicts[0]["reason"]
+    assert report  # the turn still returns the assistant's text
+
+
+def test_primitive_from_the_manager_is_gated(stubs):
+    """A Primitive obtained through the registry is gated the same way."""
+    from primitives import PrimitiveManager
+
+    manager = PrimitiveManager()
+    target = manager.create("src/app.py", {"src/db.py": "reads its settings"})
+    stubs["outputs"].append("report")
+
+    primitive_module.primitive("fix it", target, cwd="/repo")
+
+    session = stubs["sessions"][0]
+    assert session.kwargs["policy"] is not None
+    policy = session.kwargs["policy"]
+    assert policy({"toolName": "write", "cwd": "/repo",
+                   "input": {"path": "src/app.py"}}) == {"action": "allow"}
+    assert policy({"toolName": "write", "cwd": "/repo",
+                   "input": {"path": "src/db.py"}})["action"] == "block"
