@@ -10,8 +10,8 @@ dependencies = [
 
 [project.scripts]
 pi-agent = "agent.__main__:main"
-pi-triage = "roles.triage:main"
 pi-diagnose = "roles.diagnose:main"
+pi-primitive = "roles.primitive:main"
 pi-reproduce = "roles.reproduce:main"
 pi-pipeline = "tui.__main__:main"
 

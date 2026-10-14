@@ -61,13 +61,17 @@ agent/
 └── prompts/        # your saved prompts (.md files)
 
 roles/
-├── triage.py       # classify a message into a JSON verdict (write tools disabled)
 ├── diagnose.py     # diagnose an error trace into JSON findings + fixes (write tools disabled)
-├── reproduce.py    # reproduce a bug and write a failing regression test (write tools enabled)
+├── primitive.py    # modify one code unit toward an objective (all tools)
+├── reproduce.py    # reproduce a bug and confirm the error exists (write tools disabled)
 └── prompts/
-    ├── triage.md   # the triage prompt template
     ├── diagnose.md # the diagnose prompt template
+    ├── primitive.md # the primitive prompt template
     └── reproduce.md # the reproduce prompt template
+
+primitives/
+├── __init__.py     # re-exports Primitive (from roles.primitive) and the manager
+└── manager.py      # PrimitiveManager: registry of primitives keyed by source_file
 
 utils/
 ├── json_utils.py   # verify_json(): check model output is valid JSON
@@ -88,16 +92,6 @@ Requires the `pi` executable on `PATH` and Python 3.9+.
 Roles are single-purpose, model-driven tasks built on the agent package:
 
 ```sh
-pi-triage "the login button does nothing"
-pi-triage --model claude < report.txt
-```
-
-`triage` runs Pi with write-capable tools (`write`, `edit`, `bash`) disabled,
-loads its prompt from `roles/prompts/triage.md`, and asks the model to return a
-JSON verdict.  If the response is not valid JSON, it retries once in the same
-session before giving up.
-
-```sh
 pi-diagnose "$trace"
 pi-diagnose --model claude --cwd /path/to/project < traceback.txt
 ```
@@ -114,13 +108,35 @@ pi-reproduce "the login button does nothing"
 pi-reproduce --model claude --cwd /path/to/project < bug_report.txt
 ```
 
-`reproduce` runs Pi with write-capable tools *enabled* (it must create and run
-a test), loads its prompt from `roles/prompts/reproduce.md`, and asks the model
-to reproduce the reported bug and write a minimal regression test under
-`tests/`.  The prompt requires the model to observe the test **fail** against
-the buggy code before reporting success, so a reproduction that silently
-passes is rejected.  If the response is not valid JSON, it retries once in the
-same session before giving up.
+`reproduce` runs Pi with write-capable tools (`write`, `edit`) disabled — the
+model inspects the working tree and runs existing code through `bash` to
+demonstrate the error, without changing anything — loads its prompt from
+`roles/prompts/reproduce.md`, and asks the model to reproduce the reported bug
+and confirm the error exists.  Its only job is the reproduction: the agent must
+not fix the bug or write regression tests, and it reports the observed evidence
+plus the context (relevant files, reproduction steps, notes) that the
+downstream `diagnose` role needs.  If the response is not valid JSON, it retries
+once in the same session before giving up.
+
+```sh
+pi-primitive "fix the crash on startup" --file src/app.py --cwd /path/to/project
+pi-primitive --file src/app.py --dep src/db.py="reads settings from here" < objective.txt
+```
+
+`primitive` is the first role that changes the codebase, so it runs Pi with
+*every* tool available — the read, search, and list tools to reason about the
+system, `write` and `edit` to apply the change, and `bash` to run what it
+changed.  It loads its prompt from `roles/prompts/primitive.md`, which asks the
+model to reason about the objective within the primitive's dependency context
+and to modify only the portions of its own artifact that the objective
+requires.  The unit of work is a `Primitive` (defined in
+`roles/primitive.py`): the `source_file` it owns plus the `dep_files` mapping
+that records the relationships bounding it.  A `Primitive` keeps one Pi session
+attached and reuses it across objectives, so a second modification on the same
+unit does not spawn a new subprocess; `primitives.PrimitiveManager` holds the
+registry of primitives keyed by source file.  The role returns the assistant's
+report: the modification applied, or the explicit statement that no local
+change was necessary.
 
 ## Interactive pipeline (TUI)
 
@@ -140,11 +156,52 @@ while you watch it stream, and before `diagnose` starts you can press Enter to
 continue, type a message to add as operator context, or `/quit`.  Once the
 pipeline finishes, the collected role results are printed below the screen.
 
+### Flow
+
+```mermaid
+flowchart TD
+    CLI["python -m tui /path/to/codebase<br/>or pi-pipeline"] --> APP["PipelineApp.run()<br/>tui/app.py · phases: input, running, between, done"]
+    APP --> REPORT{{"human: type the bug report<br/>and press Enter"}}
+    REPORT --> ROLES
+
+    subgraph ROLES["pipeline.Pipeline — roles run in order"]
+        direction TB
+        REPRO["1 · reproduce<br/>roles/reproduce.py<br/>write tools OFF: read, grep, find, ls, bash"] --> CHECK1{"verify_json()<br/>utils/json_utils.py"}
+        CHECK1 -->|"not JSON: retry once in the same session"| REPRO
+        CHECK1 -->|"valid"| GATE{{"human: Enter to continue,<br/>type to add context, or /quit"}}
+        GATE -->|"previous result + optional context"| DIAGNOSE
+        DIAGNOSE["2 · diagnose<br/>roles/diagnose.py<br/>write tools OFF: read, grep, find, ls"] --> CHECK2{"verify_json()"}
+        CHECK2 -->|"not JSON: retry once in the same session"| DIAGNOSE
+        CHECK2 -->|"valid"| PATHS{"missing_paths()<br/>utils/path_utils.py"}
+        PATHS -->|"unresolved paths: retry once with a corrective message"| DIAGNOSE
+        PATHS -->|"still unresolved: PiError, role fails"| FAILED["role marked failed<br/>in the transcript"]
+        PATHS -->|"all paths resolve"| DONE["role results keyed by role name<br/>printed below the screen"]
+    end
+
+    subgraph AGENT["agent — one Pi subprocess per role"]
+        direction TB
+        SESSION["PiSession<br/>agent/session.py<br/>synchronous run() and retry()"] --> CLIENT["PiClient<br/>agent/client.py<br/>JSONL RPC over stdio"]
+        CLIENT --> PI(["pi --mode rpc<br/>long-lived subprocess"])
+    end
+
+    ROLES -.->|"every role opens a PiSession<br/>with cwd = codebase"| SESSION
+    SESSION -.->|"client.on_event(observer) streams<br/>every Pi event back"| APP
+    APP -->|"_translate()"| STREAM["Transcript<br/>tui/transcript.py<br/>text, thinking, tool calls"]
+    STREAM --> PAINT["screen.py paints the frame<br/>theme.py colors it"]
+```
+
+The TUI never talks to a role directly: it installs itself as the pipeline's
+`observer` and translates whatever each role's Pi subprocess emits into
+transcript lines, so the screen is a live view of work the roles are already
+doing.
+
 | Key | Action |
 |---|---|
 | type + Enter | enter the bug report / optional context |
 | Enter | continue to the next role |
 | `/quit` | exit at any input prompt |
+| `↑`/`↓`, `PgUp`/`PgDn` | scroll the transcript |
+| `Home` / `End` | jump to the top / back to the latest output |
 | `Ctrl+U` | clear the input line |
 | `Ctrl+C` | during a role: quit after the current role finishes |
 

@@ -1,13 +1,13 @@
-"""Reproduce role: turn a bug report into a failing regression test.
+"""Reproduce role: turn a bug report into confirmed evidence of an error.
 
-Runs Pi with write-capable tools *enabled* (the job is to create a test file
-and run it) and prompts it through the ``agent`` package, retrying once if the
+Runs Pi with write-capable tools *disabled* — the job is to inspect the
+codebase and run existing code to demonstrate the error, never to change
+anything — and prompts it through the ``agent`` package, retrying once if the
 model returns something that is not valid JSON.
 
-Unlike ``triage`` and ``diagnose``, this role must be able to write files and
-execute commands, so ``write``, ``edit`` and ``bash`` are enabled.  The prompt
-requires the model to observe the test *fail* before reporting a successful
-reproduction, so a reproduction that silently passes is rejected.
+The agent's only job is to reproduce the bug and confirm the error exists,
+then report the evidence plus the context the downstream ``diagnose`` role
+needs. Fixing the bug and writing regression tests are out of scope.
 """
 
 from __future__ import annotations
@@ -23,10 +23,11 @@ from utils import verify_json
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-# Reproduce must inspect, write a test, and run it.  It is the only role that
-# needs the write-capable tools: ``write``/``edit`` to create the test and
-# ``bash`` to execute it.
-REPRO_TOOLS = ("read", "write", "edit", "bash", "grep", "find", "ls")
+# Reproduce observes the bug without ever modifying the working tree:
+# ``write`` and ``edit`` are disabled, and the prompt restricts ``bash`` to
+# non-mutating commands that only read or execute existing code, since
+# demonstrating the error requires running it.
+REPRO_TOOLS = ("read", "grep", "find", "ls", "bash")
 
 
 def reproduce(
@@ -40,10 +41,12 @@ def reproduce(
 ) -> dict:
     """Reproduce ``text`` (a bug report) and return the model's JSON verdict.
 
-    ``observer``, when given, is registered as an extra event listener on the
-    session's RPC client so callers can stream progress without changing the
-    synchronous request/response contract.  ``context`` is appended to the
-    role prompt as optional operator guidance.
+    The verdict reports whether the error was reproduced, the evidence, and
+    the context the downstream diagnose role needs.  ``observer``, when given, is
+    registered as an extra event listener on the session's RPC client so
+    callers can stream progress without changing the synchronous
+    request/response contract.  ``context`` is appended to the role prompt as
+    optional operator guidance.
     """
     prompt = load_prompt(PROMPTS_DIR / "reproduce.md")
     if context:
@@ -68,7 +71,7 @@ def reproduce(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reproduce",
-        description="Reproduce a bug and write a failing regression test.",
+        description="Reproduce a bug and confirm the error exists.",
     )
     parser.add_argument(
         "text",

@@ -1,6 +1,6 @@
-"""Primitives: code units (source + deps + context) and their manager."""
+"""Primitives: code units (source + deps) and their manager."""
 
 from .manager import PrimitiveManager
-from .primitive import Primitive
+from roles.primitive import Primitive
 
 __all__ = ["Primitive", "PrimitiveManager"]

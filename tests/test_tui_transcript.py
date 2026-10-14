@@ -5,6 +5,7 @@ from __future__ import annotations
 from tui.transcript import (
     KIND_ERROR,
     KIND_ROLE,
+    KIND_SPACER,
     KIND_TEXT,
     KIND_THINKING,
     KIND_TOOL,
@@ -39,7 +40,11 @@ def test_tool_flushes_pending_text():
     t = Transcript()
     t.text("before")
     t.tool("⚙ bash …")
-    assert t.lines == [(KIND_TEXT, "before"), (KIND_TOOL, "⚙ bash …")]
+    assert t.lines == [
+        (KIND_TEXT, "before"),
+        (KIND_SPACER, ""),
+        (KIND_TOOL, "⚙ bash …"),
+    ]
 
 
 def test_extend_last_appends_to_last_line():
@@ -62,12 +67,26 @@ def test_role_banner_and_result():
     assert t.lines[0] == (KIND_ROLE, "▶ reproduce")
 
 
+def test_role_adds_spacers_with_existing_content():
+    t = Transcript()
+    t.text("hello")
+    t.settle()
+    t.role("▶ reproduce")
+    assert t.lines == [
+        (KIND_TEXT, "hello"),
+        (KIND_SPACER, ""),
+        (KIND_ROLE, "▶ reproduce"),
+        (KIND_SPACER, ""),
+    ]
+
+
 def test_info_and_error_kinds():
     t = Transcript()
     t.info("[retry 1/3]")
     t.error("boom")
     assert t.lines[0] == ("info", "[retry 1/3]")
-    assert t.lines[1] == (KIND_ERROR, "boom")
+    assert t.lines[1] == (KIND_SPACER, "")
+    assert t.lines[2] == (KIND_ERROR, "boom")
 
 
 def test_bounded_lines_drop_oldest():

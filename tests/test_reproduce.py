@@ -76,10 +76,9 @@ def test_reproduce_success_first_try(stubs):
         "summary": "boom",
         "reproduced": True,
         "reproduction": ["run it"],
-        "test_file": "tests/test_x.py",
-        "test_command": "pytest tests/test_x.py",
-        "test_fails": True,
-        "root_cause": "wrong logic",
+        "evidence": "Traceback: boom",
+        "relevant_files": ["src/x.py"],
+        "notes_for_diagnose": "crashes on startup",
     }
     stubs["outputs"].append('{"summary": "boom"}')
     verify_calls = stubs["set_verify"]([JsonCheck(ok=True, value=verdict)])
@@ -92,10 +91,13 @@ def test_reproduce_success_first_try(stubs):
     session = stubs["sessions"][0]
     assert session.closed is True
     assert session.kwargs["tools"] == reproduce_module.REPRO_TOOLS
-    # Unlike triage/diagnose, reproduce needs write + bash to create and run a test.
-    assert "write" in session.kwargs["tools"]
-    assert "edit" in session.kwargs["tools"]
+    # Reproduce must observe the bug without touching the tree: write and
+    # edit are disabled; bash and the read tools stay available to run the
+    # code that demonstrates the error.
+    assert "write" not in session.kwargs["tools"]
+    assert "edit" not in session.kwargs["tools"]
     assert "bash" in session.kwargs["tools"]
+    assert "read" in session.kwargs["tools"]
     assert session.kwargs["model"] == "claude"
     assert session.kwargs["thinking"] == "low"
     assert session.kwargs["cwd"] == "/tmp/x"
@@ -107,12 +109,15 @@ def test_reproduce_success_first_try(stubs):
     assert len(verify_calls) == 1
 
 
-def test_reproduce_enables_write_capable_tools(stubs):
+def test_reproduce_disables_write_capable_tools(stubs):
     stubs["outputs"].append("{}")
     stubs["set_verify"]([JsonCheck(ok=True, value={})])
     reproduce_module.reproduce("hi")
     tools = stubs["sessions"][0].kwargs["tools"]
-    assert "write" in tools and "edit" in tools and "bash" in tools
+    assert "write" not in tools
+    assert "edit" not in tools
+    # bash remains: reproducing means running the code, not changing it.
+    assert "bash" in tools
 
 
 def test_reproduce_retries_when_output_is_not_json(stubs):

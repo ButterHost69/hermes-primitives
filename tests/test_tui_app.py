@@ -295,10 +295,11 @@ def test_build_frame_running_hint(sized_app):
     assert cursor is None
 
 
-def test_body_chunks_wrap_and_tail(sized_app):
+def test_display_wrap_and_visible_tail(sized_app):
     sized_app.transcript.text("word " * 50)
     sized_app.transcript.settle()
-    chunks = sized_app._body_chunks(20, 3)
+    display = sized_app._display(20)
+    chunks = sized_app._visible(display, 3)
     assert len(chunks) == 3
     assert all(len(c) <= 20 for _, c in chunks)
 
@@ -482,21 +483,113 @@ def test_submit_unknown_phase(app):
 # --------------------------------------------------------------------------- #
 # More frame-building branches
 # --------------------------------------------------------------------------- #
-def test_body_chunks_multiple_short_lines(sized_app):
+def test_display_multiple_short_lines(sized_app):
     sized_app.transcript.text("a\nb")
     sized_app.transcript.settle()
-    assert sized_app._body_chunks(10, 5) == [("text", "a"), ("text", "b")]
+    assert sized_app._display(10) == [("text", "a"), ("text", "b")]
 
 
-def test_body_chunks_includes_pending(sized_app):
+def test_display_includes_pending(sized_app):
     sized_app.transcript.text("pending")
-    assert sized_app._body_chunks(10, 3) == [("text", "pending")]
+    assert sized_app._display(10) == [("text", "pending")]
 
 
-def test_body_chunks_pending_wraps_beyond_height(sized_app):
-    sized_app.transcript.text("x" * 100)
-    chunks = sized_app._body_chunks(10, 3)
-    assert len(chunks) == 3
+def test_visible_scroll_offset(sized_app):
+    sized_app.transcript.text("a\nb\nc\nd\ne")
+    sized_app.transcript.settle()
+    display = sized_app._display(10)
+    assert sized_app._visible(display, 2) == [("text", "d"), ("text", "e")]
+    sized_app._scroll_offset = 2
+    assert sized_app._visible(display, 2) == [("text", "b"), ("text", "c")]
+
+
+def test_wrap_kind_indents_tools(sized_app):
+    chunks = sized_app._wrap_kind("tool", "⚙ bash ls", 20)
+    assert all(c.startswith("  ") for c in chunks)
+
+
+def test_style_line_spacer(sized_app):
+    assert sized_app._style_line("spacer", "") == ""
+
+
+def test_scroll_up_and_down(sized_app):
+    sized_app._scroll("UP")
+    assert sized_app._scroll_offset == 1
+    assert sized_app._auto_scroll is False
+    sized_app._scroll("DOWN")
+    assert sized_app._scroll_offset == 0
+    assert sized_app._auto_scroll is True
+
+
+def test_scroll_page_step(sized_app):
+    sized_app._scroll("PAGE_UP")
+    assert sized_app._scroll_offset == 17  # body height at 24 rows
+    sized_app._scroll("PAGE_DOWN")
+    assert sized_app._scroll_offset == 0
+
+
+def test_scroll_home_jumps_to_top(sized_app):
+    sized_app._total_lines = 50
+    sized_app._scroll("HOME")
+    assert sized_app._scroll_offset == 50 - 17
+    assert sized_app._auto_scroll is False
+
+
+def test_handle_key_up_scrolls(app):
+    app.phase = "running"
+    app._handle_key("UP")
+    assert app._scroll_offset == 1
+
+
+def test_handle_key_running_home_scrolls(sized_app):
+    sized_app.phase = "running"
+    sized_app._total_lines = 100
+    sized_app._handle_key("HOME")
+    assert sized_app._scroll_offset == 100 - 17
+
+
+def test_handle_key_done_end_scrolls(sized_app):
+    sized_app.phase = "done"
+    sized_app._scroll_offset = 5
+    sized_app._handle_key("END")
+    assert sized_app._scroll_offset == 0
+    assert sized_app._auto_scroll is True
+
+
+def test_scroll_down_stays_above_bottom(sized_app):
+    sized_app._scroll_offset = 5
+    sized_app._auto_scroll = False
+    sized_app._scroll("DOWN")
+    assert sized_app._scroll_offset == 4
+    assert sized_app._auto_scroll is False
+
+
+def test_scroll_unknown_key_is_noop(sized_app):
+    sized_app._scroll_offset = 3
+    sized_app._auto_scroll = False
+    sized_app._scroll("DELETE")
+    assert sized_app._scroll_offset == 3
+    assert sized_app._auto_scroll is False
+
+
+def test_build_frame_clamps_scroll_offset(sized_app):
+    sized_app.transcript.text("a\nb")
+    sized_app.transcript.settle()
+    sized_app._scroll_offset = 50
+    sized_app._build_frame()
+    assert sized_app._scroll_offset == 0
+
+
+def test_status_content_scrolled_marker(sized_app):
+    sized_app.phase = "done"
+    sized_app._scroll_offset = 3
+    assert "scrolled" in sized_app._status_content()
+
+
+def test_phase_hint_scrolled(sized_app):
+    sized_app.phase = "running"
+    sized_app._scroll_offset = 1
+    assert "scrolled" in sized_app._phase_hint()
 
 
 def test_style_line_info_and_result(sized_app):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .primitive import Primitive
+from roles.primitive import Primitive
 
 
 class PrimitiveManager:
@@ -15,13 +15,11 @@ class PrimitiveManager:
         self,
         source_file: str,
         dep_files: dict[str, str] | None = None,
-        context: str = "",
     ) -> Primitive:
         """Create a Primitive, register it under ``source_file``, return it."""
         primitive = Primitive(
             source_file=source_file,
             dep_files=dep_files if dep_files is not None else {},
-            context=context,
         )
         self.primitive_map[source_file] = primitive
         return primitive
@@ -36,3 +34,8 @@ class PrimitiveManager:
     def search(self, source_file: str) -> Primitive | None:
         """Return the Primitive registered under ``source_file``, or ``None``."""
         return self.primitive_map.get(source_file)
+
+    def close(self) -> None:
+        """Close the attached Pi session of every registered primitive."""
+        for primitive in self.primitive_map.values():
+            primitive.close()

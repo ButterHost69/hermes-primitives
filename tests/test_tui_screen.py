@@ -196,3 +196,5 @@ def test_map_csi_home_end_delete_variants():
     assert Terminal._map_csi(b"4~") == "END"
     assert Terminal._map_csi(b"8~") == "END"
     assert Terminal._map_csi(b"3~") == "DELETE"
+    assert Terminal._map_csi(b"5~") == "PAGE_UP"
+    assert Terminal._map_csi(b"6~") == "PAGE_DOWN"
