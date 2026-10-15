@@ -172,6 +172,16 @@ class Terminal:
         """
         if self._fd is None:
             return None
+        # Drain anything already buffered from a previous multi-byte read
+        # before we block on select().  Without this, a burst of input (a
+        # paste, fast typing, or an escape sequence) is slurped by one
+        # os.read() but only one key is parsed per readable event; the rest
+        # get stranded in _keybuf whenever the fd goes idle, so a later single
+        # key press (e.g. q / Enter on the done screen) lands behind them and
+        # appears to be ignored.
+        key = self._parse_key()
+        if key is not None:
+            return key
         ready, _, _ = select.select([self._fd], [], [], timeout)  # pragma: no cover - real tty only
         if not ready:  # pragma: no cover - real tty only
             return None
