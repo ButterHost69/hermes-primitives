@@ -5,6 +5,12 @@ and paints a live, Pi-styled screen while it runs: streamed assistant text,
 tool activity, role banners, and a status bar all update in place.  The only
 interaction points are the places a human actually enters text — the initial
 bug report and an optional context message between roles.
+
+When the ``primitive_manager`` role fans its registry out, the frame grows a
+panel listing every primitive the fan-out spans — file name and state included
+— and the operator can step into any one of them to watch that agent's own
+stream, which is what the panel and the per-primitive streams are there to
+undo: a fan-out streams all of its primitives at once, interleaved.
 """
 
 from __future__ import annotations
@@ -15,6 +21,17 @@ import threading
 import time
 from typing import Any
 
+from .primitives import (
+    PRIMITIVE_KEY,
+    FILES_KEY,
+    REPORT_KEY,
+    ERROR_KEY,
+    FANNED_OUT_TYPE,
+    REPORTED_TYPE,
+    FAILED_TYPE,
+    PrimitiveFeed,
+    abbreviate,
+)
 from .screen import Terminal, pad, wrap_text
 from .theme import DARK_THEME, Theme, theme_by_name
 from .transcript import (
@@ -34,6 +51,13 @@ CTRL_C = "\x03"
 CTRL_D = "\x04"
 CTRL_U = "\x15"
 BACKSPACE = ("\x7f", "\x08")
+TAB = "\t"
+# Keys that take the operator out of the primitive they are looking at.
+LEAVE_PRIMITIVE_KEYS = ("ESC",) + BACKSPACE + ("q", "Q")
+# The primitive panel is only worth its columns in a terminal this wide.
+PANEL_MIN_WIDTH = 22
+PANEL_MAX_WIDTH = 32
+PANEL_TERM_MIN_WIDTH = 64
 
 
 class PipelineApp:
@@ -54,6 +78,10 @@ class PipelineApp:
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.transcript = Transcript()
+        # The primitives a fan-out spans, each with its own live stream.
+        self.feed = PrimitiveFeed()
+        self.selected: str | None = None
+        self.focus: str | None = None
 
         self.role_names: list[str] = list(pipeline.role_names)
         self.model = getattr(pipeline, "model_name", None) or "?"
@@ -120,21 +148,70 @@ class PipelineApp:
             self._translate(record)
 
     def _translate(self, record: dict[str, Any]) -> None:
+        """Route one streamed record to the stream it belongs to.
+
+        A record the pipeline tagged with a primitive's source file belongs to
+        that primitive's own stream; the records the pipeline emits about the
+        primitives themselves update the panel.  Everything else is the role's
+        own activity and lands in the main transcript.
+        """
+        rtype = record.get("type")
+
+        if rtype == FANNED_OUT_TYPE:
+            self._fanned_out(record)
+            return
+
+        if rtype == REPORTED_TYPE:
+            self.feed.note_report(
+                record.get(PRIMITIVE_KEY, ""), record.get(REPORT_KEY, "")
+            )
+            return
+
+        if rtype == FAILED_TYPE:
+            self.feed.note_failure(
+                record.get(PRIMITIVE_KEY, ""), record.get(ERROR_KEY, "")
+            )
+            return
+
+        source_file = record.get(PRIMITIVE_KEY)
+        target = (
+            self.feed.transcript_for(source_file) if source_file else self.transcript
+        )
+        self._apply(target, record)
+
+    def _fanned_out(self, record: dict[str, Any]) -> None:
+        """Register the primitives a fan-out just started."""
+        files = [
+            source_file
+            for source_file in record.get(FILES_KEY, [])
+            if isinstance(source_file, str) and source_file
+        ]
+        for source_file in files:
+            self.feed.register(source_file)
+        if self.selected not in self.feed.order:
+            self.selected = files[0] if files else None
+        self.transcript.info(
+            f"\u27f3 {len(files)} primitive(s) fanned out: "
+            + ", ".join(self.feed.order)
+        )
+
+    def _apply(self, target: Transcript, record: dict[str, Any]) -> None:
+        """Translate one Pi record into ``target``'s transcript."""
         rtype = record.get("type")
 
         if rtype == "message_update":
             update = record.get("assistantMessageEvent") or {}
             kind = update.get("type")
             if kind == "text_delta":
-                self.transcript.text(update.get("delta", ""))
+                target.text(update.get("delta", ""))
             elif kind == "thinking_delta" and self.show_thinking:
-                self.transcript.thinking(update.get("delta", ""))
+                target.thinking(update.get("delta", ""))
             return
 
         if rtype == "tool_execution_start":
             name = record.get("toolName") or "tool"
             brief = self._brief_args(name, record.get("args") or {})
-            self.transcript.tool(f"\u2699 {name}{brief} \u2026")
+            target.tool(f"\u2699 {name}{brief} \u2026")
             return
 
         if rtype == "tool_execution_end":
@@ -142,19 +219,17 @@ class PipelineApp:
             duration = record.get("durationMs")
             if duration is not None:
                 suffix += f" ({duration} ms)"
-            self.transcript.extend_last(suffix)
+            target.extend_last(suffix)
             return
 
         if rtype == "agent_settled":
-            self.transcript.settle()
+            target.settle()
             return
 
         if rtype == "auto_retry_start":
             attempt = record.get("attempt")
             maximum = record.get("maxAttempts")
-            self.transcript.info(
-                f"[retry {attempt}/{maximum} in {record.get('delayMs', 0)} ms]"
-            )
+            target.info(f"[retry {attempt}/{maximum} in {record.get('delayMs', 0)} ms]")
             return
 
     @staticmethod
@@ -186,6 +261,7 @@ class PipelineApp:
         self.elapsed_start = time.monotonic()
         self._scroll_offset = 0
         self._auto_scroll = True
+        self.focus = None
         self.transcript.role(f"\u25b6 {self.current_role}")
         self._role_done = None
         self._role_done_event = threading.Event()
@@ -215,6 +291,7 @@ class PipelineApp:
 
         if error is not None:
             self.error = str(error)
+            self._mark_failures(error)
             self.transcript.error(f"\u2717 {name} failed: {self.error}")
             self.phase = "done"
         else:
@@ -224,7 +301,22 @@ class PipelineApp:
                 self.phase = "done"
             else:
                 self.phase = "between"
+        self.feed.finish()
         self.previous = result
+
+    def _mark_failures(self, error: BaseException) -> None:
+        """Mark the primitives a failed fan-out names, then settle the rest.
+
+        A primitive that failed streams its failure as it happens; the ones a
+        fanned-out run left unreported are settled here, from the failures the
+        role's error carries, so the panel never keeps a finished agent
+        spinning.
+        """
+        failures = getattr(error, "failures", None)
+        if isinstance(failures, dict):
+            for source_file, failure in failures.items():
+                self.feed.note_failure(str(source_file), str(failure))
+        self.feed.finish()
 
     def _summarize_result(self, name: str, result: Any) -> str:
         try:
@@ -242,6 +334,8 @@ class PipelineApp:
         if key in ("UP", "DOWN", "PAGE_UP", "PAGE_DOWN"):
             self._scroll(key)
             return
+        if self._panel_key(key):
+            return
         if self.phase in ("input", "between"):
             self._edit_input(key)
         elif self.phase == "running":
@@ -251,10 +345,75 @@ class PipelineApp:
             elif key in ("HOME", "END"):
                 self._scroll(key)
         elif self.phase == "done":
-            if key in ENTER_KEYS or key in ("q", "Q", CTRL_C, CTRL_D):
+            if key in ("q", "Q", CTRL_C, CTRL_D):
+                self.done = True
+            elif key in ENTER_KEYS and not self.feed.order:
+                # Enter opens a primitive while the fan-out left any to read.
                 self.done = True
             elif key in ("HOME", "END"):
                 self._scroll(key)
+
+    # ------------------------------------------------------------------ #
+    # Primitive panel
+    # ------------------------------------------------------------------ #
+    def _panel_key(self, key: str) -> bool:
+        """Handle a primitive-panel key; report whether it was consumed.
+
+        The panel is only live once a fan-out has registered primitives, and
+        Enter only opens one where there is nothing to type, so a bug report
+        is never swallowed by the panel.
+        """
+        if not self.feed.order:
+            return False
+        if key == TAB:
+            self._cycle_primitive()
+            return True
+        if self.focus is not None:
+            if key in LEAVE_PRIMITIVE_KEYS:
+                self.focus = None
+                return True
+        elif key in ENTER_KEYS and self.phase in ("running", "done"):
+            self.focus = self.selected
+            return True
+        return False
+
+    def _cycle_primitive(self) -> None:
+        """Move the panel one primitive along, entering it when one is open."""
+        current = self.focus or self.selected
+        if current in self.feed.order:
+            index = self.feed.order.index(current) + 1
+        else:
+            index = 0
+        self.selected = self.feed.order[index % len(self.feed.order)]
+        if self.focus is not None:
+            self.focus = self.selected
+
+    def _panel_target(self) -> str | None:
+        """Return the primitive the panel highlights: the open one, if any."""
+        return self.focus or self.selected
+
+    def _panel_rows(self, width: int) -> list[str]:
+        """Build the primitive panel: a header and one row per primitive."""
+        rows = [
+            self.theme.style(
+                f"primitives ({len(self.feed.order)})", fg="accent", bold=True
+            )
+        ]
+        rows.extend(
+            self._panel_row(source_file, width) for source_file in self.feed.order
+        )
+        return rows
+
+    def _panel_row(self, source_file: str, width: int) -> str:
+        """Build one primitive's row: its marker, its name, and selection."""
+        selected = source_file == self._panel_target()
+        pointer = "\u25b8 " if selected else "  "
+        text = self.theme.style(
+            abbreviate(f"{pointer}{source_file}", width),
+            fg=self.feed.status_color(source_file),
+            bold=selected,
+        )
+        return self.theme.style(pad(text, width), bg="selectedBg") if selected else text
 
     def _scroll(self, key: str) -> None:
         """Adjust the transcript scroll offset.
@@ -373,17 +532,55 @@ class PipelineApp:
             return ["  " + chunk for chunk in wrap_text(text, max(1, width - 2))]
         return wrap_text(text, width)
 
-    def _display(self, width: int) -> list[tuple[str, str]]:
-        """Build the full wrapped transcript, oldest first, pending included."""
-        display: list[tuple[str, str]] = []
-        for kind, text in self.transcript.lines:
-            display.extend((kind, chunk) for chunk in self._wrap_kind(kind, text, width))
+    def _display(self, width: int) -> list[tuple[str, str, str]]:
+        """Build the full wrapped frame body, oldest first.
+
+        The main transcript comes first — the role banners and the streaming of
+        every role that ran before — and the fanned-out primitives follow it:
+        either the one stream the operator is looking at, or every primitive's
+        stream grouped under its own header.  Each row carries the source file
+        it came from as its label, which the caller paints as a file-name
+        column beside the text.
+        """
+        rows: list[tuple[str, str, str]] = [
+            (kind, "", chunk)
+            for kind, text in self.transcript.lines
+            for chunk in self._wrap_kind(kind, text, width)
+        ]
         kind, pending = self.transcript.partial()
         if pending:
-            display.extend((kind, chunk) for chunk in self._wrap_kind(kind, pending, width))
-        return display
+            rows.extend(
+                (kind, "", chunk) for chunk in self._wrap_kind(kind, pending, width)
+            )
+        if self.feed:
+            rows.append((KIND_SPACER, "", ""))
+            rows.extend(self.feed.rows(self._text_width(width), self.focus))
+        return rows
 
-    def _visible(self, display: list[tuple[str, str]], height: int) -> list[tuple[str, str]]:
+    def _label_width(self, width: int) -> int:
+        """Return the columns the file-name column of a fan-out row takes."""
+        longest = max((len(path) for path in self.feed.order), default=0)
+        return min(longest, width // 3)
+
+    def _text_width(self, width: int) -> int:
+        """Return the columns left for a fan-out row beside its file name."""
+        label = self._label_width(width)
+        return width - label - 1 if label else width
+
+    def _layout(self, width: int) -> tuple[int, int]:
+        """Return the ``(panel, body)`` column split for ``width`` columns."""
+        panel = self._panel_width(width)
+        return panel, (width - 5 - panel if panel else width - 4)
+
+    def _panel_width(self, width: int) -> int:
+        """Return the columns the primitive panel takes, or 0 without one."""
+        if not self.feed or width < PANEL_TERM_MIN_WIDTH:
+            return 0
+        return min(PANEL_MAX_WIDTH, max(PANEL_MIN_WIDTH, width // 3))
+
+    def _visible(
+        self, display: list[tuple[str, str, str]], height: int
+    ) -> list[tuple[str, str, str]]:
         """Slice the scrolled window of ``height`` lines out of ``display``."""
         offset = self._scroll_offset
         if offset <= 0:
@@ -407,13 +604,40 @@ class PipelineApp:
             return self.theme.style(text, fg="error")
         return self.theme.style(text, fg="text")
 
+    def _style_row(self, row: tuple[str, str, str], label_width: int) -> str:
+        """Style one body row, painting its file-name column when it has one.
+
+        A primitive that failed paints its file name — and its banner — in the
+        error color, so the operator sees which agent of a fan-out is out
+        before reading a word it wrote.
+        """
+        kind, label, text = row
+        if not label or label_width <= 0:
+            return self._style_line(kind, text)
+        color = self.feed.status_color(label)
+        name = self.theme.style(
+            abbreviate(label, label_width), fg=color, bold=kind == KIND_ROLE
+        )
+        if kind == KIND_ROLE:
+            # a banner belongs to the primitive as a whole: both columns
+            # carry its state
+            body = self.theme.style(text, fg=color, bold=True)
+        else:
+            body = self._style_line(kind, text)
+        return name + " " + body
+
     def _phase_hint(self) -> str:
-        if self.phase == "running":
+        if self.phase in ("running", "done"):
+            if self.focus is not None:
+                return "\u2191\u2193 scroll \u00b7 Esc or q back to every primitive"
+            if self.feed:
+                if self.phase == "done":
+                    return "Tab switch \u00b7 Enter open a primitive \u00b7 q to quit"
+                return "Tab switch \u00b7 Enter open a primitive"
+            if self.phase == "done":
+                return "press q or Enter to quit"
             if self._scroll_offset > 0:
                 return "\u2191 scrolled \u2014 press End to follow"
-            return ""
-        if self.phase == "done":
-            return "press q or Enter to quit"
         return ""
 
     def _status_content(self) -> str:
@@ -438,6 +662,8 @@ class PipelineApp:
         else:
             base = self.theme.style("\u2713  pipeline complete", fg="success")
 
+        if self.feed and self.current_role == "primitive_manager":
+            base += self.theme.style(f"  \u00b7 {self.feed.summary()}", fg="dim")
         if self._scroll_offset > 0:
             base += self.theme.style("  \u00b7 \u2191 scrolled", fg="dim")
         return base
@@ -447,28 +673,82 @@ class PipelineApp:
         text = self.theme.style(self.input_line, fg="text")
         return prefix + text
 
+    def _split_rule(self, joiner: str, panel_width: int) -> str:
+        """Build a frame rule that closes the primitive panel's column."""
+        width, _ = self.term.size()
+        head = panel_width
+        tail = max(0, width - panel_width - 3)
+        rule = "\u251c" + "\u2500" * head + joiner + "\u2500" * tail + "\u2524"
+        return self.theme.style(rule, fg="borderMuted")
+
+    def _split_row(self, panel: str, body: str, panel_width: int, body_width: int) -> str:
+        """Build one frame row split into the panel and the body column."""
+        border = self.theme.style("\u2502", fg="borderMuted")
+        return (
+            border
+            + " "
+            + self._pad(panel, panel_width - 2)
+            + " "
+            + border
+            + " "
+            + self._pad(body, body_width)
+            + " "
+            + border
+        )
+
+    def _body_lines(
+        self,
+        visible: list[tuple[str, str, str]],
+        panel: list[str],
+        height: int,
+        panel_width: int,
+        body_width: int,
+        label_width: int,
+    ) -> list[str]:
+        """Build the body rows of a frame that carries the primitive panel."""
+        rows: list[str] = []
+        for index in range(height):
+            panel_cell = panel[index] if index < len(panel) else ""
+            row = visible[index] if index < len(visible) else None
+            body_cell = self._style_row(row, label_width) if row is not None else ""
+            rows.append(
+                self._split_row(panel_cell, body_cell, panel_width, body_width)
+            )
+        return rows
+
     def _build_frame(self) -> tuple[list[str], tuple[int, int] | None]:
         width, height = self.term.size()
         body_height = max(1, height - 7)
-        body_width = width - 4
+        panel_width, body_width = self._layout(width)
 
         display = self._display(body_width)
         self._total_lines = len(display)
         max_offset = max(0, self._total_lines - body_height)
         if self._scroll_offset > max_offset:
             self._scroll_offset = max_offset
+        visible = self._visible(display, body_height)
+        label_width = self._label_width(body_width)
 
         lines: list[str] = []
         lines.append(self._rule("\u256d", "\u256e"))
         lines.append(self._row(self._header_content()))
-        lines.append(self._rule("\u251c", "\u2524"))
 
-        for kind, chunk in self._visible(display, body_height):
-            lines.append(self._row(self._style_line(kind, chunk)))
-        while len(lines) < 3 + body_height:
-            lines.append(self._row(""))
-
-        lines.append(self._rule("\u251c", "\u2524"))
+        if panel_width:
+            lines.append(self._split_rule("\u252c", panel_width))
+            panel = self._panel_rows(panel_width - 2)
+            lines.extend(
+                self._body_lines(
+                    visible, panel, body_height, panel_width, body_width, label_width
+                )
+            )
+            lines.append(self._split_rule("\u2534", panel_width))
+        else:
+            lines.append(self._rule("\u251c", "\u2524"))
+            for row in visible:
+                lines.append(self._row(self._style_row(row, label_width)))
+            while len(lines) < 3 + body_height:
+                lines.append(self._row(""))
+            lines.append(self._rule("\u251c", "\u2524"))
         cursor: tuple[int, int] | None = None
         if self.phase in ("input", "between"):
             lines.append(self._row(self._prompt_content()))
