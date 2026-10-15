@@ -400,7 +400,7 @@ def test_primitive_from_the_manager_is_gated(stubs):
     from roles.primitive_manager import PrimitiveManager
 
     manager = PrimitiveManager()
-    target = manager.create("src/app.py")
+    target = manager.create_primitive("src/app.py")
     stubs["outputs"].append("report")
 
     target.run("fix it")

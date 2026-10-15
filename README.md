@@ -109,7 +109,7 @@ agent/
 roles/
 ├── diagnose.py     # diagnose an error trace into JSON findings + fixes (write tools disabled)
 ├── primitive.py    # modify one code unit toward an objective (all tools)
-├── primitive_manager.py # PrimitiveManager: registry of primitives keyed by source_file (drives no model, so it has no prompt)
+├── primitive_manager.py # PrimitiveManager: registry of primitives keyed by source_file, plus create_all()/call_all() (drives no model of its own, so it has no prompt)
 ├── reproduce.py    # reproduce a bug and confirm the error exists (write tools disabled)
 └── prompts/
     ├── diagnose.md # the diagnose prompt template
@@ -187,10 +187,21 @@ requires.  The unit of work is a `Primitive` (defined in
 that records the relationships bounding it.  A `Primitive` keeps one Pi session
 attached and reuses it across objectives, so a second modification on the same
 unit does not spawn a new subprocess; `roles.primitive_manager.PrimitiveManager`
-holds the registry of primitives keyed by source file.  The role returns the
-assistant's
-report: the modification applied, or the explicit statement that no local
-change was necessary.
+holds the registry of primitives keyed by source file.  It registers work with
+`create_primitive(source_file)` (one path at a time) or `create_all(paths)` (a
+whole list), and runs it with `call_primitive(source_file)` or `call_all()`:
+`call_all` is `call_primitive` applied to the registry, so a path with no
+primitive registered simply produces no report.  `PrimitiveManager` drives no
+model of its own, which is why it has no prompt.  The role returns the
+assistant's report: the modification applied, or the explicit statement that no
+local change was necessary.
+
+The pipeline runs these roles in order — `reproduce` answers whether the bug is
+real, `diagnose` names the files responsible for it, and
+`pipeline._run_primitive_manager` turns that diagnosis into the registry's
+input: it registers a primitive per diagnosed file with `create_all`, calls
+them all with `call_all`, closes the registry afterwards, and keys each
+primitive's objective to the finding that named its file.
 
 ## Interactive pipeline (TUI)
 
@@ -206,9 +217,9 @@ pi-pipeline /path/to/codebase --theme light
 ```
 
 You are prompted for the bug report first.  The `reproduce` role then runs
-while you watch it stream, and before `diagnose` starts you can press Enter to
-continue, type a message to add as operator context, or `/quit`.  Once the
-pipeline finishes, the collected role results are printed below the screen.
+while you watch it stream, and before each following role starts you can press
+Enter to continue, type a message to add as operator context, or `/quit`.  Once
+the pipeline finishes, the collected role results are printed below the screen.
 
 ### Flow
 
@@ -229,7 +240,9 @@ flowchart TD
         CHECK2 -->|"valid"| PATHS{"missing_paths()<br/>utils/path_utils.py"}
         PATHS -->|"unresolved paths: retry once with a corrective message"| DIAGNOSE
         PATHS -->|"still unresolved: PiError, role fails"| FAILED["role marked failed<br/>in the transcript"]
-        PATHS -->|"all paths resolve"| DONE["role results keyed by role name<br/>printed below the screen"]
+        PATHS -->|"all paths resolve"| GATE2{{"human: Enter to continue,<br/>type to add context, or /quit"}}
+        GATE2 -->|"diagnosis + optional context"| PRIMITIVES
+        PRIMITIVES["3 · primitive_manager<br/>pipeline.Pipeline<br/>create_all(diagnosed files) → call_all()<br/>one gated primitive per diagnosed file"] --> DONE["role results keyed by role name<br/>printed below the screen"]
     end
 
     subgraph AGENT["agent — one Pi subprocess per role"]
