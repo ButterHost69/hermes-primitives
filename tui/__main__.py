@@ -83,6 +83,12 @@ def main(argv: list[str] | None = None) -> None:
     sys.stdout.write("\n")
     for name, result in results.items():
         sys.stdout.write(f"{name}: {result}\n")
+    error = getattr(app, "error", None)
+    if error:
+        # A role failed: the results say nothing about it, so the run would
+        # otherwise look like a finished one that simply did nothing.
+        sys.stderr.write(f"error: {error}\n")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":  # pragma: no cover

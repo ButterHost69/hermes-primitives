@@ -101,6 +101,10 @@ class GatedPiClient(PiClient):
         gate timeout cannot reach the extension through it; this override passes
         one.  Decisions run off the reader thread, so parallel tool calls do not
         serialize behind the policy.
+
+        Pi's stderr is captured for the reason the base client captures it: a
+        fatal startup error has to stay reportable, not be inherited by our
+        terminal.
         """
         if not self._extension_path.is_file():
             raise PiError(f"tool gate extension not found: {self._extension_path}")
@@ -109,12 +113,13 @@ class GatedPiClient(PiClient):
                 self._build_argv(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=None,  # Pi diagnostics flow through to our stderr
+                stderr=subprocess.PIPE,
                 cwd=self.cwd,
                 env=self._child_env(),
             )
         except OSError as exc:  # pragma: no cover - environment dependent
             raise PiError(f"failed to start `pi`: {exc}") from exc
+        self._drain_stderr(self._process)
         self._pool = self._new_pool()
         self._reader = threading.Thread(
             target=self._read_loop, name="pi-rpc-reader", daemon=True
