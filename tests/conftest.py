@@ -111,6 +111,42 @@ def fake_pi(tmp_path, monkeypatch):
     return str(script)
 
 
+# --------------------------------------------------------------------------- #
+# Fake `pi` that dies at startup
+#
+# The shape of the real failure behind the TUI timeout: Pi validates the
+# ``--model`` argument, finds it ambiguous across two authenticated providers,
+# writes the reason to stderr and exits 1 without ever speaking JSONL.  The
+# short delay keeps the subprocess alive across the client's initial
+# ``running`` check, so it dies *while* a command is being awaited -- which is
+# the case the client has to notice.
+# --------------------------------------------------------------------------- #
+_CRASH_PI_BODY = r'''
+import sys
+import time
+
+time.sleep(0.3)
+sys.stderr.write(
+    'Error: Model "step-5-preview-free" is ambiguous across providers: '
+    "opencode-go/step-5-preview-free, opencode/step-5-preview-free. "
+    "More than one matching provider is authenticated. "
+    "Use --provider or provider/model.\n"
+)
+sys.stderr.flush()
+sys.exit(1)
+'''
+
+
+@pytest.fixture
+def crash_pi(tmp_path, monkeypatch):
+    """Put a fake `pi` that dies at startup at the front of PATH."""
+    script = tmp_path / "pi"
+    script.write_text("#!" + sys.executable + "\n" + _CRASH_PI_BODY)
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    return str(script)
+
+
 @pytest.fixture
 def wait_for():
     """Poll a predicate until it is true or the deadline passes."""

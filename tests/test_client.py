@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 
 import pytest
@@ -388,3 +389,96 @@ def test_dispatch_swallows_handler_exception():
     client.on_event(lambda record: seen.append(record["type"]))
     client._dispatch({"type": "agent_start"})
     assert seen == ["agent_start"]
+
+
+# --------------------------------------------------------------------------- #
+# Stderr capture internals (direct, no subprocess)
+# --------------------------------------------------------------------------- #
+class _BrokenStderr:
+    """A stderr pipe that yields two lines, a blank one, then dies.
+
+    The blank line exercises the tail's filter; the ``OSError`` is the pipe
+    closing under the drainer, which the drain has to survive quietly.
+    """
+
+    def __init__(self):
+        self.lines = [
+            b"Error: model is ambiguous\n",
+            b"\n",
+            b"hint: use provider/model\n",
+        ]
+        self.failed = threading.Event()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.lines:
+            return self.lines.pop(0)
+        self.failed.set()
+        raise OSError("pipe closed under us")
+
+
+class _ExitedProc:
+    """A reaped subprocess: a return code and nothing left to stream."""
+
+    def __init__(self, returncode: int = 1):
+        self.returncode = returncode
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+
+    def poll(self):
+        return self.returncode
+
+
+class _PipedProc:
+    """A subprocess whose stderr is the given pipe."""
+
+    def __init__(self, stderr):
+        self.stderr = stderr
+
+
+def test_drain_stderr_keeps_the_tail_and_survives_a_closed_pipe(wait_for):
+    client = make_client()
+    stderr = _BrokenStderr()
+
+    client._drain_stderr(_ExitedProc())  # no stderr pipe: nothing to drain
+    client._drain_stderr(_PipedProc(stderr))
+
+    assert wait_for(lambda: stderr.failed.is_set(), timeout=5.0)
+    assert wait_for(
+        lambda: client._stderr_tail
+        == ["Error: model is ambiguous", "hint: use provider/model"]
+    )
+    assert client._stderr_reason() == (
+        "Error: model is ambiguous | hint: use provider/model"
+    )
+
+
+def test_stderr_reason_is_empty_when_nothing_was_captured():
+    assert make_client()._stderr_reason() == ""
+
+
+def test_exit_response_names_the_exit_code_and_the_reason():
+    client = make_client()
+    client._stderr_tail = ['Error: model "x" is ambiguous across providers']
+
+    response = client._exit_response(
+        {"type": "prompt", "id": "req-7"}, _ExitedProc(returncode=1)
+    )
+
+    assert response["type"] == "response"
+    assert response["command"] == "prompt"
+    assert response["id"] == "req-7"
+    assert response["success"] is False
+    assert "code 1" in response["error"]
+    assert "ambiguous" in response["error"]
+
+
+def test_exit_response_without_a_reason_still_reports_the_exit():
+    client = make_client()
+    response = client._exit_response({"type": "get_state", "id": "req-8"}, _ExitedProc(2))
+    assert response["success"] is False
+    assert response["error"] == "pi exited (code 2) before responding to get_state"
+    assert "timed out" not in response["error"]

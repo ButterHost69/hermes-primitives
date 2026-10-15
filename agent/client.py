@@ -19,6 +19,16 @@ from typing import Any, Callable, Sequence
 
 EventCallback = Callable[[dict[str, Any]], None]
 
+#: How often a command re-checks the subprocess while it waits.  Pi's death
+#: is announced by no record on the wire -- not a response, not a notification
+#: -- so the wait must be bounded for that check to be reached.
+_POLL_INTERVAL = 0.05
+
+#: How many stderr lines are kept to explain a failure.  Pi reports startup
+#: failures (an ambiguous model, a bad provider) on stderr and then exits, so
+#: the tail of that stream is the only story available about why it died.
+_STDERR_TAIL_LINES = 5
+
 
 class PiError(RuntimeError):
     """Raised when Pi cannot be started or a request fails."""
@@ -51,6 +61,7 @@ class PiClient:
         self._cond = threading.Condition()
         self._write_lock = threading.Lock()
         self._ids = itertools.count(1)
+        self._stderr_tail: list[str] = []
 
     # ------------------------------------------------------------------ #
     # Process lifecycle
@@ -94,18 +105,24 @@ class PiClient:
         return argv
 
     def start(self) -> None:
-        """Launch the Pi subprocess and start the stdout reader thread."""
+        """Launch the Pi subprocess and start the stdout reader thread.
+
+        Pi's stderr is captured rather than inherited: it is where Pi reports a
+        fatal startup problem, and those lines have to survive until a command
+        can fail with them.
+        """
         try:
             self._process = subprocess.Popen(
                 self._build_argv(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=None,  # Pi diagnostics flow through to our stderr
+                stderr=subprocess.PIPE,
                 cwd=self.cwd,
             )
         except OSError as exc:  # pragma: no cover - environment dependent
             raise PiError(f"failed to start `pi`: {exc}") from exc
 
+        self._drain_stderr(self._process)
         self._reader = threading.Thread(
             target=self._read_loop, name="pi-rpc-reader", daemon=True
         )
@@ -150,8 +167,14 @@ class PiClient:
         """Register a callback for session events and non-response records."""
         self._handlers.append(handler)
 
-    def send(self, command: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
-        """Send one command and block until its correlated response arrives."""
+    def send(self, command: dict[str, Any], timeout: float = 90.0) -> dict[str, Any]:
+        """Send one command and block until its correlated response arrives.
+
+        A Pi that dies while the command is in flight can never answer it, so
+        the wait stops as soon as the subprocess is gone and the failure says
+        so, instead of holding the caller for the whole ``timeout`` and then
+        reporting a timeout.
+        """
         if not self.running:
             raise PiError("Pi is not running")
         assert self._process is not None and self._process.stdin is not None
@@ -172,6 +195,9 @@ class PiClient:
         deadline = time.monotonic() + timeout
         with self._cond:
             while rid not in self._pending:
+                if self._process is not None and self._process.poll() is not None:
+                    self._pending.pop(rid, None)
+                    return self._exit_response(outgoing, self._process)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._pending.pop(rid, None)
@@ -182,8 +208,25 @@ class PiClient:
                         "error": "request timed out",
                         "id": rid,
                     }
-                self._cond.wait(remaining)
+                self._cond.wait(min(remaining, _POLL_INTERVAL))
             return self._pending.pop(rid)
+
+    def _exit_response(
+        self, outgoing: dict[str, Any], proc: subprocess.Popen[bytes]
+    ) -> dict[str, Any]:
+        """Build the failure response for a command a dead Pi cannot answer."""
+        code = proc.returncode if proc.returncode is not None else proc.poll()
+        error = f"pi exited (code {code}) before responding to {outgoing.get('type')}"
+        reason = self._stderr_reason()
+        if reason:
+            error += f": {reason}"
+        return {
+            "type": "response",
+            "command": outgoing.get("type"),
+            "success": False,
+            "error": error,
+            "id": outgoing.get("id"),
+        }
 
     def command_ok(self, command: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
         """Send a command and return its ``data``, raising on failure."""
@@ -258,3 +301,35 @@ class PiClient:
             except Exception:
                 # A display callback must never kill the reader thread.
                 pass
+
+    # ------------------------------------------------------------------ #
+    # Stderr capture
+    # ------------------------------------------------------------------ #
+    def _drain_stderr(self, proc: subprocess.Popen[bytes]) -> None:
+        """Keep the tail of Pi's stderr in :attr:`_stderr_tail`.
+
+        A daemon thread reads the stream: leaving it unread would fill the pipe
+        and block the child, and dropping it would lose the one message that
+        explains why Pi died.  Only the last few non-empty lines are kept --
+        enough for a fatal report, bounded for a long-lived session.
+        """
+        if proc.stderr is None:
+            return
+
+        def drain() -> None:
+            try:
+                assert proc.stderr is not None
+                for raw in proc.stderr:
+                    line = raw.decode("utf-8", "replace").rstrip()
+                    if line:
+                        self._stderr_tail.append(line)
+                        del self._stderr_tail[:-_STDERR_TAIL_LINES]
+            except Exception:
+                # The pipe closed under us (Pi died): the tail is what it is.
+                pass
+
+        threading.Thread(target=drain, name="pi-stderr-drainer", daemon=True).start()
+
+    def _stderr_reason(self) -> str:
+        """Render the captured stderr tail as a single-line reason."""
+        return " | ".join(self._stderr_tail)

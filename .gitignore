@@ -11,3 +11,4 @@ wheels/
 
 # Pi session files
 /.sessions/
+.environment
