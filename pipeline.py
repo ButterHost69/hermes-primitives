@@ -6,6 +6,15 @@ talk to a model API directly — and :meth:`Pipeline.run` executes the roles in
 order: ``reproduce`` answers whether the bug is real, ``diagnose`` names the
 files responsible for it, and ``primitive_manager`` registers a Primitive per
 diagnosed file and calls each one to apply the fix.
+
+An observer installed on the pipeline sees every record every role's Pi
+subprocess streams.  The primitives of a fan-out all share that one observer,
+so the pipeline stamps each record with the source file that emitted it
+(:data:`SOURCE_FILE_KEY`) and publishes the fan-out itself as it goes: the
+files it spans (:data:`FANNED_OUT_TYPE`), the report each primitive came back
+with (:data:`REPORTED_TYPE`), and the failure each one raised
+(:data:`FAILED_TYPE`).  That is how a viewer follows the agents of a fan-out
+one by one instead of watching their records interleave.
 """
 
 from __future__ import annotations
@@ -17,6 +26,15 @@ from typing import Any, Callable
 from roles import diagnose as diagnose_role
 from roles import reproduce as reproduce_role
 from roles.primitive_manager import PrimitiveManager
+
+# Key that tags every record a primitive streams with the source file the
+# primitive that emitted it owns.
+SOURCE_FILE_KEY = "primitive"
+
+# Record types the pipeline publishes about a fan-out as it runs.
+FANNED_OUT_TYPE = "primitives_fanned_out"
+REPORTED_TYPE = "primitive_reported"
+FAILED_TYPE = "primitive_failed"
 
 
 def _diagnosis_findings(diagnosis: Any) -> list[dict[str, Any]]:
@@ -161,8 +179,16 @@ class Pipeline:
         and supplies the objective each primitive is called with.  The
         primitives run under this pipeline's model, reasoning level, working
         directory, and observer, and their reports come back keyed by source
-        file.  The registry is closed afterwards, so no Pi session outlives
-        the role.
+        file.  Every primitive streams through the one observer, so each one
+        is given a wrapper that tags its records with the file it owns: a
+        fan-out's records arrive interleaved, and only the tag says whose
+        agent produced which.  The fan-out itself is published as it runs —
+        the files it spans, and which of them came back or failed — so an
+        observer can follow the primitives one by one.
+
+        ``call_all`` fans the primitives out over a pool and closes each
+        session as the fan-out ends; the registry is closed again after
+        it — closing is idempotent — so no Pi session outlives the role.
         """
         work = _primitive_work(diagnosis)
         objectives = dict(work)
@@ -171,14 +197,69 @@ class Pipeline:
                 source_file: f"{objective}\n\n{context}"
                 for source_file, objective in objectives.items()
             }
+        files = list(dict.fromkeys(source_file for source_file, _ in work))
         manager = PrimitiveManager(objectives=objectives)
-        manager.create_all(
-            [source_file for source_file, _ in work], **self._session_kwargs()
-        )
+        for source_file in files:
+            manager.create_primitive(
+                source_file, **self._primitive_kwargs(source_file)
+            )
+        self._publish({"type": FANNED_OUT_TYPE, "files": files})
         try:
-            return manager.call_all()
+            return manager.call_all(
+                on_report=self._primitive_reported,
+                on_failure=self._primitive_failed,
+            )
         finally:
             manager.close()
+
+    def _primitive_kwargs(self, source_file: str) -> dict[str, Any]:
+        """Return the session kwargs for one primitive of the fan-out.
+
+        The observer a pipeline was given is shared by every primitive, so it
+        is replaced here with one that tags what it forwards; a pipeline no
+        one is watching keeps the plain ``None``.
+        """
+        kwargs = self._session_kwargs()
+        if kwargs.get("observer") is not None:
+            kwargs["observer"] = self._tagged_observer(source_file)
+        return kwargs
+
+    def _tagged_observer(
+        self, source_file: str
+    ) -> Callable[[dict[str, Any]], None]:
+        """Wrap the observer so a primitive's records name their source file."""
+
+        def observe(record: dict[str, Any]) -> None:
+            tagged = dict(record)
+            tagged[SOURCE_FILE_KEY] = source_file
+            self._publish(tagged)
+
+        return observe
+
+    def _publish(self, record: dict[str, Any]) -> None:
+        """Hand ``record`` to the observer, when one is installed."""
+        if self.observer is not None:
+            self.observer(record)
+
+    def _primitive_reported(self, source_file: str, report: str) -> None:
+        """Publish that ``source_file``'s primitive came back with ``report``."""
+        self._publish(
+            {
+                "type": REPORTED_TYPE,
+                SOURCE_FILE_KEY: source_file,
+                "report": report,
+            }
+        )
+
+    def _primitive_failed(self, source_file: str, failure: BaseException) -> None:
+        """Publish that ``source_file``'s primitive raised ``failure``."""
+        self._publish(
+            {
+                "type": FAILED_TYPE,
+                SOURCE_FILE_KEY: source_file,
+                "error": str(failure),
+            }
+        )
 
     # ------------------------------------------------------------------ #
     # Public API

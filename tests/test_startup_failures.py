@@ -231,6 +231,25 @@ def test_session_run_fails_fast_when_pi_dies_at_startup(crash_pi):
     assert "timed out" not in str(error)
 
 
+def test_session_run_fails_fast_when_pi_dies_mid_turn(crash_mid_turn_pi):
+    """The same fast failure for a Pi that settles nothing and exits.
+
+    The prompt is accepted, so the failure cannot hide in ``send``; the turn
+    that never settles is what has to give up, without the 120s session
+    timeout being the thing that ends it.
+    """
+    session = PiSession(timeout=30.0)
+    try:
+        outcome = run_with_deadline(lambda: session.run("hi"), deadline=6.0)
+    finally:
+        session.close()
+
+    error = outcome.get("error")
+    assert isinstance(error, PiError), f"expected a PiError, got {outcome!r}"
+    assert "timed out" not in str(error)
+    assert "pi exited" in str(error)
+
+
 def test_reproduce_fails_fast_and_says_why_pi_died(crash_pi, tmp_path):
     """The TUI's first role, on the ambiguous model, must fail with Pi's reason.
 

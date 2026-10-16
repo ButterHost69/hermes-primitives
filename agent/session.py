@@ -9,9 +9,14 @@ final text back.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Callable, Sequence
 
 from .client import PiClient, PiError
+
+# How often ``run`` re-checks the settled event while it waits for a turn to
+# end, so a Pi that dies mid-turn is noticed without polling hot.
+_SETTLE_POLL_INTERVAL = 0.5
 
 
 class PiSession:
@@ -116,16 +121,36 @@ class PiSession:
         """Send ``message`` and return the assistant's final text.
 
         Blocks until the turn settles or ``timeout`` seconds elapse.  Raises
-        :class:`~agent.client.PiError` if the prompt is rejected or the turn
-        does not finish in time.
+        :class:`~agent.client.PiError` if the prompt is rejected, the Pi
+        process dies before the turn settles, or the turn does not finish in
+        time.
         """
         self._clear()
         response = self.client.prompt(message, steer=steer, follow_up=follow_up)
         if not response.get("success", False):
             raise PiError(response.get("error") or "prompt rejected")
-        if not self._settled.wait(timeout if timeout is not None else self.timeout):
-            raise PiError("timed out waiting for the assistant to finish")
+        self._wait_for_settle(timeout if timeout is not None else self.timeout)
         return "".join(self._parts)
+
+    def _wait_for_settle(self, timeout: float) -> None:
+        """Block until the turn settles, fails, or outlives ``timeout``.
+
+        Waiting on the settled event alone holds the caller for the whole
+        timeout when Pi dies mid-turn: a process that is gone can never
+        settle.  Polling the client's liveness beside the event turns that
+        into an immediate failure, while a turn that settles on time returns
+        at once -- the event wakes its own wait, so the poll adds no latency
+        to a healthy turn.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PiError("timed out waiting for the assistant to finish")
+            if self._settled.wait(min(remaining, _SETTLE_POLL_INTERVAL)):
+                return
+            if not self.client.running:
+                raise PiError("pi exited before the turn settled")
 
     def retry(
         self,

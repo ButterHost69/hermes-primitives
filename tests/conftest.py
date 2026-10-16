@@ -147,6 +147,55 @@ def crash_pi(tmp_path, monkeypatch):
     return str(script)
 
 
+# --------------------------------------------------------------------------- #
+# Fake `pi` that dies mid-turn
+#
+# The prompt is accepted -- ``send`` gets its response -- and the process then
+# exits without ever emitting ``agent_settled``.  A reader that only waits for
+# the settled event can never be woken, which is the shape of a Pi crash the
+# session has to turn into an immediate failure.
+# --------------------------------------------------------------------------- #
+_CRASH_MID_TURN_PI_BODY = r'''
+import json
+import sys
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def respond(cmd, success=True, data=None):
+    record = {"type": "response", "command": cmd.get("type"), "success": success}
+    if cmd.get("id") is not None:
+        record["id"] = cmd["id"]
+    if data is not None:
+        record["data"] = data
+    out(record)
+
+
+for line in sys.stdin:
+    try:
+        cmd = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if cmd.get("type") in ("prompt", "steer", "follow_up"):
+        respond(cmd, data={"disposition": "started"})
+        sys.exit(3)  # the agent died: no agent_settled will ever arrive
+    respond(cmd, data={})
+'''
+
+
+@pytest.fixture
+def crash_mid_turn_pi(tmp_path, monkeypatch):
+    """Put a fake `pi` that accepts a prompt and dies before it settles."""
+    script = tmp_path / "pi"
+    script.write_text("#!" + sys.executable + "\n" + _CRASH_MID_TURN_PI_BODY)
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    return str(script)
+
+
 @pytest.fixture
 def wait_for():
     """Poll a predicate until it is true or the deadline passes."""
@@ -393,3 +442,170 @@ def gate_pi(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.delenv("HMS_TEST_GATE_REQUEST", raising=False)
     return str(script)
+
+
+# --------------------------------------------------------------------------- #
+# Evaluator fixtures
+#
+# A fake environment root shaped like the real one: ``codebase/<n>/`` holds a
+# project whose one-line bug the oracle suite detects, and ``solution/<n>/``
+# holds that oracle suite plus a reference diff.  The oracle suites locate the
+# codebase by walking up from their own location, the way the real ones do.
+# --------------------------------------------------------------------------- #
+
+BUGGY_MODULE = "VALUE = 1  # the bug: the oracle expects 2\n"
+FIXED_MODULE = "VALUE = 2\n"
+
+ORACLE_TEMPLATE = '''\
+"""Oracle for codebase/{number}: VALUE must be 2."""
+
+import os
+import sys
+import unittest
+
+
+def _find_codebase(number):
+    directory = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        candidate = os.path.join(directory, "codebase", str(number))
+        if os.path.isfile(os.path.join(candidate, "pkg", "__init__.py")):
+            sys.path.insert(0, candidate)
+            return candidate
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    raise RuntimeError("codebase not found")
+
+
+_find_codebase(__NUMBER__)
+from pkg.mod import VALUE  # noqa: E402
+
+
+class Oracle(unittest.TestCase):
+    def test_value(self):
+        self.assertEqual(VALUE, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+PROJECT_TEMPLATE = '''\
+"""The project's own tests: VALUE exists and is an int."""
+
+import unittest
+
+from pkg.mod import VALUE
+
+
+class Project(unittest.TestCase):
+    def test_value_is_int(self):
+        self.assertIsInstance(VALUE, int)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+
+ORACLE_JS_TEMPLATE = """\
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+
+function findCodebase(number) {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = path.join(dir, 'codebase', String(number));
+    if (fs.existsSync(path.join(candidate, 'src', 'mod.js'))) return candidate;
+    dir = path.dirname(dir);
+  }
+  throw new Error('codebase not found');
+}
+
+const { VALUE } = require(path.join(findCodebase(__NUMBER__), 'src', 'mod.js'));
+
+test('oracle: VALUE is 2', () => {
+  assert.strictEqual(VALUE, 2);
+});
+"""
+
+PROJECT_JS_TEMPLATE = """\
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert');
+const { VALUE } = require('../src/mod.js');
+
+test('project: VALUE is an int', () => {
+  assert.strictEqual(typeof VALUE, 'number');
+});
+"""
+
+REFERENCE_DIFF = """\
+diff --git a/pkg/mod.py b/pkg/mod.py
+index 1111111..2222222 100644
+--- a/pkg/mod.py
++++ b/pkg/mod.py
+@@ -1 +1 @@
+-VALUE = 1  # the bug: the oracle expects 2
++VALUE = 2
+"""
+
+
+def _write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def make_codebase(root: Path, number: int, name: str, *, fixed: bool = False) -> Path:
+    """Write a python project (``pkg/mod.py``, own tests, README, Issues.md)."""
+    codebase = root / "codebase" / str(number)
+    _write(codebase / "pkg" / "__init__.py", "")
+    _write(codebase / "pkg" / "mod.py", FIXED_MODULE if fixed else BUGGY_MODULE)
+    _write(codebase / "tests" / "__init__.py", "")
+    _write(codebase / "tests" / "test_project.py", PROJECT_TEMPLATE)
+    _write(codebase / "README.md", f"# {name}\n\nA fake project.\n")
+    _write(codebase / "Issues.md", f"{name}: VALUE should be 2.\n")
+    return codebase
+
+
+def make_solution(root: Path, number: int, *, kind: str = "py") -> Path:
+    """Write a case's oracle suite and reference diff under ``solution/<n>/``."""
+    solution = root / "solution" / str(number)
+    if kind == "js":
+        _write(solution / "test_oracle.js", ORACLE_JS_TEMPLATE.replace("__NUMBER__", str(number)))
+    else:
+        _write(solution / "test_oracle.py", ORACLE_TEMPLATE.replace("__NUMBER__", str(number)))
+    _write(solution / "pkg" / "mod.py.diff", REFERENCE_DIFF)
+    return solution
+
+
+def make_environment(
+    tmp_path: Path,
+    *,
+    name: str = ".environment",
+    fixed: tuple[int, ...] = (1,),
+    js_case: int | None = None,
+) -> Path:
+    """Build an environment root with two (or three) cases.
+
+    Case 1 is fixed when asked, case 2 always ships buggy, and ``js_case``
+    adds one more case whose oracle is a node:test suite.
+    """
+    root = tmp_path / name
+    make_codebase(root, 1, "Alpha", fixed=1 in fixed)
+    make_solution(root, 1)
+    make_codebase(root, 2, "Beta", fixed=2 in fixed)
+    make_solution(root, 2)
+    if js_case is not None:
+        codebase = root / "codebase" / str(js_case)
+        _write(codebase / "src" / "mod.js", "module.exports = { VALUE: 2 };\n")
+        _write(codebase / "tests" / "mod.test.js", PROJECT_JS_TEMPLATE)
+        _write(codebase / "README.md", "# Gamma\n")
+        _write(codebase / "Issues.md", "Gamma: VALUE should be 2.\n")
+        make_solution(root, js_case, kind="js")
+    return root

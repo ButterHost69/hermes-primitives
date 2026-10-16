@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import agent.session as session_module
@@ -22,6 +24,8 @@ class StubClient:
             "success": True, "data": {"disposition": "started"},
         }
         self.events = events if events is not None else []
+        self.running = True
+        self.die_after_prompt = False
 
     def start(self):
         self.started = True
@@ -37,6 +41,8 @@ class StubClient:
         for record in self.events:
             for handler in list(self.handlers):
                 handler(record)
+        if self.die_after_prompt:
+            self.running = False
         return self.response
 
     def emit(self, record):
@@ -260,6 +266,19 @@ def test_run_explicit_timeout_override(make_session):
     client, session = make_session(events=[], timeout=5.0)
     with pytest.raises(PiError, match="timed out"):
         session.run("x", timeout=0.05)
+
+
+def test_run_raises_when_pi_dies_before_the_turn_settles(make_session):
+    """A Pi that cannot settle anymore fails the run, it does not wait it out."""
+    client, session = make_session(events=[], timeout=30.0)
+    client.die_after_prompt = True
+
+    started = time.monotonic()
+    with pytest.raises(PiError, match="pi exited before the turn settled"):
+        session.run("x")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 10  # the 30s timeout never became the ending
 
 
 def test_run_clears_previous_state(make_session):

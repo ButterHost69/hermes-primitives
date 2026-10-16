@@ -8,6 +8,7 @@ import pytest
 
 import pipeline
 import roles.primitive
+from roles.primitive_manager import PrimitiveRunError
 
 
 class StubSession:
@@ -17,8 +18,11 @@ class StubSession:
         self.kwargs = kwargs
         self.runs: list[str] = []
         self.closed = False
+        self.error: BaseException | None = None
 
     def run(self, prompt: str) -> str:
+        if self.error is not None:
+            raise self.error
         self.runs.append(prompt)
         return "report"
 
@@ -219,7 +223,17 @@ def test_primitives_run_under_the_pipeline_configuration(diagnosis_roles, tmp_pa
         assert session.kwargs["model"] == "claude"
         assert session.kwargs["thinking"] == "low"
         assert session.kwargs["cwd"] == str(tmp_path.resolve())
-        assert session.kwargs["observer"] is observer
+        # every primitive streams through its own wrapper around the observer,
+        # so a fanned-out record carries the file that emitted it
+        session.kwargs["observer"]({"type": "tool_execution_start", "toolName": "read"})
+
+    records = []
+    pipe.observer = records.append
+    pipe._primitive_kwargs("src/app.py")["observer"]({"type": "agent_settled"})
+    assert records == [{
+        "type": "agent_settled",
+        pipeline.SOURCE_FILE_KEY: "src/app.py",
+    }]
 
 
 def test_operator_context_is_appended_to_every_objective(diagnosis_roles, tmp_path):
@@ -231,6 +245,96 @@ def test_operator_context_is_appended_to_every_objective(diagnosis_roles, tmp_pa
         session.runs[0].endswith("\n\nkeep the public API")
         for session in diagnosis_roles["sessions"]
     )
+
+
+def test_the_fan_out_streams_every_primitive_separately(diagnosis_roles, tmp_path):
+    """Records from a fan-out carry the file that emitted them."""
+    records: list[dict] = []
+    pipe = pipeline.Pipeline(
+        tmp_path, "claude", "low", "secret", observer=records.append
+    )
+
+    pipe.run("x")
+
+    streamed = [record for record in records if pipeline.SOURCE_FILE_KEY in record]
+    assert streamed
+    assert {record[pipeline.SOURCE_FILE_KEY] for record in streamed} == {
+        "src/app.py",
+        "src/db.py",
+    }
+    # the record the client built is left as it was
+    assert all("type" in record for record in streamed)
+
+
+def test_the_fan_out_publishes_its_own_lifecycle(diagnosis_roles, tmp_path):
+    records: list[dict] = []
+    pipe = pipeline.Pipeline(
+        tmp_path, "claude", "low", "secret", observer=records.append
+    )
+
+    pipe.run("x")
+
+    announced = [record for record in records if record["type"] == "primitives_fanned_out"]
+    reported = [record for record in records if record["type"] == "primitive_reported"]
+    assert [record["files"] for record in announced] == [
+        ["src/app.py", "src/db.py"]
+    ]
+    # reports stream as the primitives finish, which the pool orders
+    assert dict((r["primitive"], r["report"]) for r in reported) == {
+        "src/app.py": "report",
+        "src/db.py": "report",
+    }
+
+
+def test_a_primitive_that_fails_is_published_as_it_happens(
+    diagnosis_roles, monkeypatch, tmp_path
+):
+    records: list[dict] = []
+    pipe = pipeline.Pipeline(
+        tmp_path, "claude", "low", "secret", observer=records.append
+    )
+    sessions = diagnosis_roles["sessions"]
+
+    def make_session(**kwargs):
+        session = StubSession(**kwargs)
+        # the first primitive the diagnosis named refuses to run
+        session.error = RuntimeError("the model refused") if not sessions else None
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(roles.primitive, "GatedPiSession", make_session)
+
+    with pytest.raises(PrimitiveRunError):
+        pipe.run("x")
+
+    failed = [record for record in records if record["type"] == "primitive_failed"]
+    assert [record["primitive"] for record in failed] == ["src/app.py"]
+    assert "the model refused" in failed[0]["error"]
+    # the sibling still ran and came back
+    assert [len(session.runs) for session in sessions] == [0, 1]
+
+
+def test_one_finding_per_file_however_many_times_it_is_named(diagnosis_roles, tmp_path):
+    """Two findings naming one file are one primitive, registered once."""
+    diagnosis = {
+        "findings": [
+            {"file": "src/app.py", "explanation": "first", "fixes": ["fix it"]},
+            {"file": "src/app.py", "explanation": "second", "fixes": ["fix it too"]},
+        ]
+    }
+    records: list[dict] = []
+    pipe = pipeline.Pipeline(
+        tmp_path, "claude", "low", "secret", observer=records.append
+    )
+
+    results = pipe.run_step("primitive_manager", diagnosis)
+
+    assert list(results) == ["src/app.py"]
+    assert len(diagnosis_roles["sessions"]) == 1
+    announced = [
+        record for record in records if record["type"] == "primitives_fanned_out"
+    ]
+    assert [record["files"] for record in announced] == [["src/app.py"]]
 
 
 def test_findings_without_work_are_skipped(fake_roles, tmp_path):

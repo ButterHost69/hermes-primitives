@@ -14,6 +14,7 @@ pi-diagnose = "roles.diagnose:main"
 pi-primitive = "roles.primitive:main"
 pi-reproduce = "roles.reproduce:main"
 pi-pipeline = "tui.__main__:main"
+pi-evaluate = "evaluator.__main__:main"
 
 [dependency-groups]
 dev = [

@@ -124,9 +124,22 @@ utils/
 tui/
 ├── __main__.py     # CLI entry point (python -m tui / pi-pipeline)
 ├── app.py          # PipelineApp: drives the pipeline in a live terminal UI
+├── primitives.py   # PrimitiveFeed: one labelled stream per fanned-out primitive
 ├── screen.py       # raw mode, frame painting, and key parsing
 ├── theme.py        # OKHSL -> ANSI truecolor, matching Pi's dark/light themes
 └── transcript.py   # ordered, bounded stream of role activity
+
+evaluator/
+├── __init__.py     # public API: discover_cases(), evaluate(), Case, Grade, Report
+├── case.py         # Case + discover_cases(): pair codebase/<n> with solution/<n>
+├── runner.py       # run_oracle()/run_project_tests(): subprocess suites, parsed
+├── diffing.py      # candidate_diff(): the live tree against the baseline
+├── grader.py       # grade_case(): the Pi grading session + rubric normalization
+├── report.py       # CaseResult/Report: table, JSON, per-case artifacts
+├── engine.py       # evaluate_case()/evaluate_cases(): phase order + fan-out
+├── prompts/
+│   └── grade.md    # the grader prompt template (rubric + output contract)
+└── __main__.py     # CLI entry point (python -m evaluator / pi-evaluate)
 ```
 
 Requires the `pi` executable on `PATH` and Python 3.9+.
@@ -191,16 +204,27 @@ holds the registry of primitives keyed by source file.  It registers work with
 `create_primitive(source_file)` (one path at a time) or `create_all(paths)` (a
 whole list), and runs it with `call_primitive(source_file)` or `call_all()`:
 `call_all` is `call_primitive` applied to the registry, so a path with no
-primitive registered simply produces no report.  `PrimitiveManager` drives no
-model of its own, which is why it has no prompt.  The role returns the
+primitive registered simply produces no report.  It runs the registry in
+parallel, one worker per primitive (`max_workers` caps that, `1` runs them in
+registration order), collects each report as it comes back, and closes every
+session before it returns — joined first, so no agent is torn down while it is
+still running.  A path whose primitive fails does not take its siblings' reports
+with it, but it fails the call with `PrimitiveRunError`, which carries the
+reports that did come back beside the failures that did not.  Closing is
+resilient the same way: one session that refuses to close cannot strand the
+sessions behind it — every primitive is attended to, and the paths that could
+not be closed are reported afterwards with `PrimitiveCloseError`.  A session
+also fails fast when its Pi dies mid-turn, instead of waiting out its timeout
+on a turn that can never settle.  `PrimitiveManager`
+drives no model of its own, which is why it has no prompt.  The role returns the
 assistant's report: the modification applied, or the explicit statement that no
 local change was necessary.
 
 The pipeline runs these roles in order — `reproduce` answers whether the bug is
 real, `diagnose` names the files responsible for it, and
 `pipeline._run_primitive_manager` turns that diagnosis into the registry's
-input: it registers a primitive per diagnosed file with `create_all`, calls
-them all with `call_all`, closes the registry afterwards, and keys each
+input: it registers a primitive per diagnosed file with `create_all`, fans them
+all out with `call_all`, closes the registry afterwards, and keys each
 primitive's objective to the finding that named its file.
 
 ## Interactive pipeline (TUI)
@@ -242,7 +266,7 @@ flowchart TD
         PATHS -->|"still unresolved: PiError, role fails"| FAILED["role marked failed<br/>in the transcript"]
         PATHS -->|"all paths resolve"| GATE2{{"human: Enter to continue,<br/>type to add context, or /quit"}}
         GATE2 -->|"diagnosis + optional context"| PRIMITIVES
-        PRIMITIVES["3 · primitive_manager<br/>pipeline.Pipeline<br/>create_all(diagnosed files) → call_all()<br/>one gated primitive per diagnosed file"] --> DONE["role results keyed by role name<br/>printed below the screen"]
+        PRIMITIVES["3 · primitive_manager<br/>pipeline.Pipeline<br/>create_all(diagnosed files) → call_all()<br/>call_all() fans out concurrently<br/>one gated primitive per diagnosed file"] --> DONE["role results keyed by role name<br/>printed below the screen"]
     end
 
     subgraph AGENT["agent — one Pi subprocess per role"]
@@ -254,13 +278,19 @@ flowchart TD
     ROLES -.->|"every role opens a PiSession<br/>with cwd = codebase"| SESSION
     SESSION -.->|"client.on_event(observer) streams<br/>every Pi event back"| APP
     APP -->|"_translate()"| STREAM["Transcript<br/>tui/transcript.py<br/>text, thinking, tool calls"]
+    APP -->|"records tagged with the source file<br/>that emitted them"| FEED["PrimitiveFeed<br/>tui/primitives.py<br/>one labelled stream per primitive<br/>running / done / failed"]
     STREAM --> PAINT["screen.py paints the frame<br/>theme.py colors it"]
+    FEED --> PAINT
 ```
 
 The TUI never talks to a role directly: it installs itself as the pipeline's
 `observer` and translates whatever each role's Pi subprocess emits into
 transcript lines, so the screen is a live view of work the roles are already
-doing.
+doing.  The primitives of a fan-out all stream through that one observer, so
+the pipeline tags each record with the source file that emitted it and
+publishes the fan-out itself — [the app routes those records to
+`tui/primitives.py`](#watching-the-fanned-out-primitives), which keeps one
+stream per primitive and the state each one is in.
 
 | Key | Action |
 |---|---|
@@ -271,6 +301,113 @@ doing.
 | `Home` / `End` | jump to the top / back to the latest output |
 | `Ctrl+U` | clear the input line |
 | `Ctrl+C` | during a role: quit after the current role finishes |
+| `Tab` | move along the primitives of a fan-out |
+| `Enter` | open the highlighted primitive and watch only its stream |
+| `Esc` / `q` / `Backspace` | leave one primitive and see the whole fan-out again |
 
 Controls available while a role is running are minimal by design — the TUI is
 a watchable view of the pipeline, not a second interactive agent session.
+
+### Watching the fanned-out primitives
+
+`primitive_manager` is the role that fans out: `call_all()` runs every
+registered primitive at once, one gated Pi session per diagnosed file, so
+left alone every agent's stream would interleave into one unreadable river.
+The pipeline keeps them apart: it stamps each record a primitive streams with
+the source file that emitted it (the `primitive` key on the record), and it
+publishes the fan-out itself as it goes — the files it spans, the report each
+primitive came back with, and the failure each one raised.  The TUI turns that
+into a panel beside the transcript:
+
+```
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ hms pipeline · claude · low · role 3/3                                        │
+├──────────────────────────┬────────────────────────────────────────────────────┤
+│ primitives (3)           │ ⟳ src/parser.py                          0.0s      │
+│ ▸ environment/…/parser.py│   parser.py ⚙ read src/parser.py … ✓ (12 ms)       │
+│   environment/…/db.py    │   parser.py ⚙ edit src/parser.py …                │
+│   environment/…/toolbar  │ ✓ src/db.py                              0.0s     │
+│                          │   db.py closing the cursor …                      │
+│                          │ ✗ environment/…/toolbar.py               failed    │
+│                          │   toolbar.py ✗ pi exited before the turn settled  │
+├──────────────────────────┴────────────────────────────────────────────────────┤
+│ Tab switch · Enter open a primitive                                           │
+│ ⠹  running primitive_manager · 0.0s  · 3 primitives · 1 running · 1 error      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+Every primitive of the fan-out is listed in the panel with its marker and file
+name, and its stream is streamed in the body under a header of its own, each
+line labelled with the file it came from.  A file name is painted in the
+theme's error color the moment its agent fails — before any of its output is
+read — and in the success color once it has reported.  `Tab` moves along the
+list, `Enter` opens the highlighted primitive so the body shows only that
+agent, `↑`/`↓` scrolls it, and `Esc`/`q`/`Backspace` return to the whole
+fan-out.  The panel is dropped in a terminal narrower than 64 columns, where
+the streams stay labelled inline instead.
+
+## Evaluator (final fix validator)
+
+`evaluator/` judges a finished run and nothing else: it imports only the
+public `agent` and `utils` surfaces — no `pipeline`, `roles`, or `tui` — so
+it can evaluate a run long after it finished, from another process, or
+against a copy.
+
+```sh
+pi-evaluate                                  # .environment/ (or environment/)
+pi-evaluate --environment ./environment --codebase 2 --codebase 5
+pi-evaluate --no-grade                       # tests only, no model calls
+pi-evaluate --grade-all --json report.json --report-dir artifacts/
+```
+
+An **environment root** holds `codebase/<n>/` (the projects) and
+`solution/<n>/` (each project's oracle suite plus its reference diff).  The
+default root is the gitignored `.environment/` where pipeline runs land; the
+pristine `environment/` is the **baseline**, which the run auto-pairs with
+its live sibling.  `--baseline`/`--no-baseline` override that.
+
+Each case runs four phases in order — the codebase's **own** tests (B), the
+**oracle** suite (A), the **candidate diff** against the baseline (C), and
+the **grader** (D) — while the baseline tree's verification runs beside the
+live branch:
+
+```mermaid
+flowchart TD
+    subgraph CASE["one case (its own thread)"]
+        direction TB
+        LIVE["live tree branch"] --> B["B · project tests (live)"]
+        B --> A["A · oracle suite (live)<br/>must PASS"]
+        BASE["baseline tree branch"] --> BP["B′ · project tests (baseline)"]
+        BP --> AP["A′ · oracle suite (baseline)<br/>must FAIL"]
+        A --> C["C · candidate diff (µs)"]
+        AP --> C
+        A --> GATE{"A passed?<br/>(or --grade-all)"}
+        C --> GATE
+        GATE -->|"yes"| D["D · grader Pi session<br/>cwd = live codebase"]
+        GATE -->|"no, default"| SKIP["not graded · verdict = fail"]
+    end
+```
+
+The oracle gates grading: a fix that does not pass its oracle is never
+graded unless `--grade-all` asks for the diagnostic grade (correctness then
+counts zero).  A′ is the **negative control** — an oracle suite that passes on
+the buggy baseline detects nothing, and the case fails on a broken
+environment instead of a grade.  The grader (read-only tools plus `bash`,
+one Pi session with `cwd` at the codebase) receives the issue, the reference
+diff, the candidate diff, and every test result, and returns a weighted JSON
+verdict: correctness 40, equivalence to the reference 25, minimality 20,
+quality 15 — `pass` at 85+, `partial` at 60–84, `fail` below.  It re-reads
+the working tree itself, which is what catches what the oracle cannot: scope
+creep into unrequested files, dead defensive code, untested divergences from
+the reference.
+
+Cases are independent and grading dominates the wall clock, so
+`evaluate_cases` fans the cases out over a thread pool — one worker per case
+by default (`--jobs` caps it; `--jobs 1` is sequential).  A failing grader
+never takes its siblings down: it becomes that case's `error` outcome.  The
+console table stays deterministic; `--report-dir` writes per-case artifacts
+(`oracle.txt`, `own-tests.txt`, `candidate.diff`, `grade.json`,
+`result.json`).
+
+Exit codes: `0` every case passed, `1` the run finished but something failed,
+`2` a setup problem (no environment, no cases, bad arguments).

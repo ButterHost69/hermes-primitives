@@ -301,7 +301,7 @@ def test_display_wrap_and_visible_tail(sized_app):
     display = sized_app._display(20)
     chunks = sized_app._visible(display, 3)
     assert len(chunks) == 3
-    assert all(len(c) <= 20 for _, c in chunks)
+    assert all(len(text) <= 20 for _, _, text in chunks)
 
 
 def test_rule_and_row_width(sized_app):
@@ -486,21 +486,21 @@ def test_submit_unknown_phase(app):
 def test_display_multiple_short_lines(sized_app):
     sized_app.transcript.text("a\nb")
     sized_app.transcript.settle()
-    assert sized_app._display(10) == [("text", "a"), ("text", "b")]
+    assert sized_app._display(10) == [("text", "", "a"), ("text", "", "b")]
 
 
 def test_display_includes_pending(sized_app):
     sized_app.transcript.text("pending")
-    assert sized_app._display(10) == [("text", "pending")]
+    assert sized_app._display(10) == [("text", "", "pending")]
 
 
 def test_visible_scroll_offset(sized_app):
     sized_app.transcript.text("a\nb\nc\nd\ne")
     sized_app.transcript.settle()
     display = sized_app._display(10)
-    assert sized_app._visible(display, 2) == [("text", "d"), ("text", "e")]
+    assert sized_app._visible(display, 2) == [("text", "", "d"), ("text", "", "e")]
     sized_app._scroll_offset = 2
-    assert sized_app._visible(display, 2) == [("text", "b"), ("text", "c")]
+    assert sized_app._visible(display, 2) == [("text", "", "b"), ("text", "", "c")]
 
 
 def test_wrap_kind_indents_tools(sized_app):
@@ -631,3 +631,384 @@ def test_build_frame_with_transcript(sized_app):
     sized_app.transcript.settle()
     lines, _ = sized_app._build_frame()
     assert any("hello" in line for line in lines)
+
+
+# --------------------------------------------------------------------------- #
+# The fanned-out primitives
+# --------------------------------------------------------------------------- #
+def _fanned_out(app, files=("src/app.py", "src/db.py")):
+    """Register a fan-out and stream one record from each of its primitives."""
+    app._translate({"type": "primitives_fanned_out", "files": list(files)})
+    for source_file in files:
+        app._translate(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "working"},
+                "primitive": source_file,
+            }
+        )
+
+
+def test_fanned_out_registers_every_primitive_and_announces_them(app):
+    _fanned_out(app)
+
+    assert app.feed.order == ["src/app.py", "src/db.py"]
+    assert app.selected == "src/app.py"
+    assert "2 primitive(s) fanned out" in app.transcript.lines[-1][1]
+
+
+def test_fanned_out_ignores_entries_that_name_no_file(app):
+    app._translate({"type": "primitives_fanned_out", "files": ["src/app.py", "", None]})
+
+    assert app.feed.order == ["src/app.py"]
+    assert app.selected == "src/app.py"
+
+
+def test_fanned_out_keeps_the_selection_a_later_role_left_on_a_primitive(app):
+    _fanned_out(app)
+    app.selected = "src/db.py"
+
+    _fanned_out(app, files=("src/other.py",))
+
+    assert app.selected == "src/db.py"
+
+
+def test_primitive_records_reach_their_own_stream(app):
+    _fanned_out(app)
+
+    assert app.transcript.lines == [] or all(
+        line[0] == "info" for line in app.transcript.lines
+    )
+    app.feed.transcript_for("src/app.py").settle()
+    app.feed.transcript_for("src/db.py").settle()
+    assert app.feed.streams["src/app.py"].lines[-1] == ("text", "working")
+    assert app.feed.streams["src/db.py"].lines[-1] == ("text", "working")
+
+
+def test_a_primitive_the_fan_out_never_announced_is_still_streamed(app):
+    app._translate(
+        {
+            "type": "tool_execution_start",
+            "toolName": "read",
+            "args": {"path": "src/late.py"},
+            "primitive": "src/late.py",
+        }
+    )
+
+    assert app.feed.order == ["src/late.py"]
+    assert app.feed.streams["src/late.py"].lines[-1][1] == "\u2699 read  src/late.py \u2026"
+
+
+def test_primitive_report_settles_its_stream(app):
+    _fanned_out(app)
+
+    app._translate(
+        {"type": "primitive_reported", "primitive": "src/app.py", "report": "fixed it"}
+    )
+
+    assert app.feed.status["src/app.py"] == "done"
+    assert app.feed.streams["src/app.py"].lines[-1] == ("result", "fixed it")
+
+
+def test_primitive_failure_turns_its_file_name_red(app):
+    _fanned_out(app)
+
+    app._translate(
+        {
+            "type": "primitive_failed",
+            "primitive": "src/db.py",
+            "error": "pi exited before the turn settled",
+        }
+    )
+
+    assert app.feed.status["src/db.py"] == "error"
+    assert app.feed.marker("src/db.py") == "\u2717"
+    assert app.feed.status_color("src/db.py") == "error"
+    assert app.feed.status_color("src/app.py") == "accent"
+
+
+def test_role_failure_marks_the_primitives_it_names(app):
+    from roles.primitive_manager import PrimitiveRunError
+
+    app.phase = "running"
+    app.feed.register("src/app.py")
+    app.feed.register("src/db.py")
+    app._role_done = (
+        "primitive_manager",
+        None,
+        PrimitiveRunError({"src/db.py": RuntimeError("boom")}, {"src/app.py": "fixed"}),
+    )
+
+    app._check_role_done()
+
+    assert app.feed.status["src/db.py"] == "error"
+    assert app.feed.status["src/app.py"] == "done"
+    assert app.phase == "done"
+
+
+def test_finished_fan_out_settles_the_primitives_that_reported_nothing(app):
+    app.phase = "running"
+    app.feed.register("src/app.py")
+    app.role_index = 2
+    app._role_done = ("primitive_manager", {"src/app.py": "fixed"}, None)
+
+    app._check_role_done()
+
+    assert app.feed.status["src/app.py"] == "done"
+
+
+def test_tab_cycles_the_panel_and_enters_the_primitive(app):
+    _fanned_out(app)
+    app.phase = "running"
+
+    app._handle_key("\t")
+
+    assert app.selected == "src/db.py"
+    assert app.focus is None
+
+    app._handle_key("\t")
+
+    assert app.selected == "src/app.py"
+
+
+def test_enter_opens_the_selected_primitive(app):
+    _fanned_out(app)
+    app.phase = "running"
+
+    app._handle_key("\r")
+
+    assert app.focus == "src/app.py"
+
+
+def test_tab_stepping_while_a_primitive_is_open_moves_to_the_next_one(app):
+    _fanned_out(app)
+    app.phase = "running"
+    app.focus = "src/app.py"
+
+    app._handle_key("\t")
+
+    assert app.focus == "src/db.py"
+
+
+def test_esc_or_q_leaves_an_open_primitive(app):
+    _fanned_out(app)
+    app.phase = "running"
+    app.focus = "src/app.py"
+
+    app._handle_key("\x7f")
+    assert app.focus is None
+
+    app.focus = "src/app.py"
+    app._handle_key("q")
+    assert app.focus is None
+
+
+def test_a_key_the_open_primitive_does_not_use_falls_through(app):
+    _fanned_out(app)
+    app.phase = "running"
+    app.focus = "src/app.py"
+
+    app._handle_key("\r")
+
+    assert app.focus == "src/app.py"
+    assert app.done is False
+
+
+def test_tab_from_a_stale_selection_returns_to_the_first_primitive(app):
+    _fanned_out(app)
+    app.selected = "src/vanished.py"
+
+    app._handle_key("\t")
+
+    assert app.selected == "src/app.py"
+
+
+def test_enter_does_not_open_a_primitive_where_text_is_entered(app):
+    _fanned_out(app)
+    app.phase = "between"
+
+    app._handle_key("\r")
+
+    assert app.focus is None
+
+
+def test_panel_keys_are_inert_before_a_fan_out(app):
+    app.phase = "running"
+
+    assert app._panel_key("\t") is False
+    assert app._panel_key("\r") is False
+    assert app.selected is None
+
+
+def test_starting_a_role_drops_the_open_primitive(app):
+    _fanned_out(app)
+    app.focus = "src/app.py"
+
+    app._start_role(0)
+
+    assert app.focus is None
+
+
+def test_panel_width_follows_the_terminal(sized_app):
+    _fanned_out(sized_app)
+
+    assert sized_app._panel_width(80) == 26
+    assert sized_app._panel_width(90) == 30
+    assert sized_app._panel_width(400) == 32
+    assert sized_app._panel_width(60) == 0
+
+
+def test_panel_width_is_zero_without_primitives(sized_app):
+    assert sized_app._panel_width(120) == 0
+
+    _fanned_out(sized_app)
+
+    assert sized_app._panel_width(120) == 32
+
+
+def test_display_appends_the_fan_out_after_the_main_transcript(sized_app):
+    _fanned_out(sized_app)
+    sized_app.feed.streams["src/app.py"].settle()
+    sized_app.feed.streams["src/db.py"].settle()
+
+    rows = sized_app._display(40)
+
+    kinds = [kind for kind, _, _ in rows]
+    assert "info" in kinds  # the fan-out announcement
+    assert kinds.count("role") == 2  # one header per primitive
+    assert ("text", "src/app.py", "working") in rows
+    assert ("text", "src/db.py", "working") in rows
+
+
+def test_display_labels_only_the_focused_stream_when_one_is_open(sized_app):
+    _fanned_out(sized_app)
+    sized_app.feed.streams["src/app.py"].settle()
+    sized_app.feed.streams["src/db.py"].settle()
+    sized_app.focus = "src/db.py"
+
+    rows = sized_app._display(40)
+
+    assert ("text", "src/app.py", "working") not in rows
+    assert ("text", "src/db.py", "working") in rows
+
+
+def test_display_labels_are_shortened_before_the_text_column(sized_app):
+    sized_app._translate(
+        {"type": "primitives_fanned_out", "files": ["environment/codebase/src/app.py"]}
+    )
+    sized_app.feed.streams["environment/codebase/src/app.py"].text("working")
+    sized_app.feed.streams["environment/codebase/src/app.py"].settle()
+
+    assert sized_app._label_width(40) == 13
+    assert sized_app._text_width(40) == 26
+    # a body too narrow for both columns still leaves the label its column
+    assert sized_app._label_width(3) == 1
+    assert sized_app._text_width(3) == 1
+
+
+def test_style_row_paints_the_file_name_in_the_state_color(sized_app):
+    _fanned_out(sized_app)
+    sized_app.feed.note_failure("src/db.py", "boom")
+
+    running = sized_app._style_row(("text", "src/app.py", "working"), 12)
+    failed = sized_app._style_row(("text", "src/db.py", "working"), 12)
+
+    assert "src/app.py" in running
+    assert "src/db.py" in failed
+    assert failed != running
+    # a banner paints both columns in the same color
+    banner = sized_app._style_row(("role", "src/db.py", "\u2717  failed"), 12)
+    assert banner.count("38;2;229;103;108") == 2
+
+
+def test_style_row_without_a_label_column_styles_the_text_alone(sized_app):
+    assert sized_app._style_row(("text", "src/app.py", "working"), 0) == (
+        sized_app._style_line("text", "working")
+    )
+
+
+def test_build_frame_splits_the_panel_and_the_body(sized_app):
+    _fanned_out(sized_app)
+    sized_app.feed.streams["src/app.py"].settle()
+    sized_app.feed.streams["src/db.py"].settle()
+    sized_app.phase = "running"
+    sized_app.current_role = "primitive_manager"
+
+    lines, _ = sized_app._build_frame()
+
+    assert len(lines) == 24
+    assert all(visible_width(line) == 80 for line in lines)
+    assert any("primitives (2)" in line for line in lines)
+    assert any("src/db.py" in line for line in lines)
+
+
+def test_build_frame_keeps_a_narrow_terminal_single_column(sized_app, monkeypatch):
+    _fanned_out(sized_app)
+    monkeypatch.setattr(sized_app.term, "size", lambda: (60, 24))
+
+    lines, _ = sized_app._build_frame()
+
+    assert all(visible_width(line) == 60 for line in lines)
+    assert not any("primitives (2)" in line for line in lines)
+
+
+def test_panel_row_highlights_the_open_primitive(sized_app):
+    _fanned_out(sized_app)
+    sized_app.feed.note_failure("src/db.py", "boom")
+
+    selected = sized_app._panel_row("src/app.py", 24)
+    other = sized_app._panel_row("src/db.py", 24)
+
+    assert visible_width(selected) == 24
+    assert visible_width(other) < 24  # not padded to the selected background
+    assert "src/app.py" in selected and "src/db.py" in other
+    assert selected.startswith("\x1b[48;2;")
+
+
+def test_panel_rows_are_headed_with_the_fan_out_size(sized_app):
+    _fanned_out(sized_app)
+
+    rows = sized_app._panel_rows(24)
+
+    assert "primitives (2)" in rows[0]
+    assert len(rows) == 3
+
+
+def test_status_content_counts_the_fan_out(sized_app):
+    _fanned_out(sized_app)
+    sized_app.phase = "running"
+    sized_app.current_role = "primitive_manager"
+    sized_app.elapsed_start = time.monotonic()
+
+    assert "2 primitives" in sized_app._status_content()
+
+
+def test_status_content_has_no_fan_out_summary_for_another_role(sized_app):
+    _fanned_out(sized_app)
+    sized_app.phase = "running"
+    sized_app.current_role = "reproduce"
+    sized_app.elapsed_start = time.monotonic()
+
+    assert "primitives" not in sized_app._status_content()
+
+
+def test_phase_hint_lists_the_panel_keys(sized_app):
+    _fanned_out(sized_app)
+    sized_app.phase = "running"
+    assert "Tab switch" in sized_app._phase_hint()
+    assert "Enter open" in sized_app._phase_hint()
+
+    sized_app.focus = "src/app.py"
+    assert "Esc or q back" in sized_app._phase_hint()
+
+    sized_app.focus = None
+    sized_app.phase = "done"
+    assert "q to quit" in sized_app._phase_hint()
+
+
+def test_done_without_a_fan_out_still_quits_on_enter(sized_app):
+    sized_app.phase = "done"
+
+    sized_app._handle_key("\r")
+
+    assert sized_app.done is True
