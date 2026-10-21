@@ -213,16 +213,6 @@ def test_submit_input_starts_first_role(fake_pipeline):
     assert app.previous == "the login button does nothing"
 
 
-def test_submit_between_starts_next_role_with_context(fake_pipeline):
-    app = PipelineApp(fake_pipeline, color=False)
-    app.phase = "between"
-    app.role_index = 0
-    app.previous = {"summary": "reproduced"}
-    app.input_line = "extra context"
-    app._submit()
-    assert app.current_role == "diagnose"
-
-
 # --------------------------------------------------------------------------- #
 # Role execution
 # --------------------------------------------------------------------------- #
@@ -237,7 +227,8 @@ def test_run_role_and_check_done(fake_pipeline):
             break
         time.sleep(0.01)
     app._check_role_done()
-    assert app.phase == "between"
+    assert app.phase == "running"
+    assert app.current_role == "diagnose"
     assert app.results["reproduce"] == {"summary": "reproduced", "test_fails": True}
     assert fake_pipeline.run_step_calls[0][0] == "reproduce"
     assert fake_pipeline.run_step_calls[0][1] == "prompt"
@@ -607,11 +598,6 @@ def test_phase_hint_other(sized_app):
     assert sized_app._phase_hint() == ""
 
 
-def test_status_content_between(sized_app):
-    sized_app.phase = "between"
-    assert "Enter" in sized_app._status_content()
-
-
 def test_status_content_done_success(sized_app):
     sized_app.phase = "done"
     assert "pipeline complete" in sized_app._status_content()
@@ -825,7 +811,7 @@ def test_tab_from_a_stale_selection_returns_to_the_first_primitive(app):
 
 def test_enter_does_not_open_a_primitive_where_text_is_entered(app):
     _fanned_out(app)
-    app.phase = "between"
+    app.phase = "input"
 
     app._handle_key("\r")
 

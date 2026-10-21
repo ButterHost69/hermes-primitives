@@ -3,8 +3,7 @@
 :class:`PipelineApp` drives a :class:`~pipeline.Pipeline` one role at a time
 and paints a live, Pi-styled screen while it runs: streamed assistant text,
 tool activity, role banners, and a status bar all update in place.  The only
-interaction points are the places a human actually enters text — the initial
-bug report and an optional context message between roles.
+interaction point is where a human enters text — the initial bug report.
 
 When the ``primitive_manager`` role fans its registry out, the frame grows a
 panel listing every primitive the fan-out spans — file name and state included
@@ -87,7 +86,7 @@ class PipelineApp:
         self.model = getattr(pipeline, "model_name", None) or "?"
         self.thinking = getattr(pipeline, "reasoning", None) or "?"
 
-        self.phase = "input"  # input | running | between | done
+        self.phase = "input"  # input | running | done
         self.current_role: str | None = None
         self.role_index = 0
         self.previous: Any = None
@@ -297,12 +296,12 @@ class PipelineApp:
         else:
             self.results[name] = result
             self.transcript.result(self._summarize_result(name, result))
+            self.previous = result
             if self._quit_requested or self.role_index >= len(self.role_names) - 1:
                 self.phase = "done"
             else:
-                self.phase = "between"
+                self._start_role(self.role_index + 1)
         self.feed.finish()
-        self.previous = result
 
     def _mark_failures(self, error: BaseException) -> None:
         """Mark the primitives a failed fan-out names, then settle the rest.
@@ -336,7 +335,7 @@ class PipelineApp:
             return
         if self._panel_key(key):
             return
-        if self.phase in ("input", "between"):
+        if self.phase == "input":
             self._edit_input(key)
         elif self.phase == "running":
             if key == CTRL_C:
@@ -499,8 +498,6 @@ class PipelineApp:
                 return
             self.previous = text
             self._start_role(0)
-        elif self.phase == "between":
-            self._start_role(self.role_index + 1, context=text or None)
 
     # ------------------------------------------------------------------ #
     # Frame building
@@ -652,11 +649,6 @@ class PipelineApp:
                 f"{spinner}  running {self.current_role} \u00b7 {elapsed:.1f}s",
                 fg="warning",
             )
-        elif self.phase == "between":
-            base = self.theme.style(
-                "\u25cf  Enter to continue, type to add context, or /quit",
-                fg="success",
-            )
         elif self.error is not None:
             base = self.theme.style(f"\u2717  {self.error}", fg="error")
         else:
@@ -750,7 +742,7 @@ class PipelineApp:
                 lines.append(self._row(""))
             lines.append(self._rule("\u251c", "\u2524"))
         cursor: tuple[int, int] | None = None
-        if self.phase in ("input", "between"):
+        if self.phase == "input":
             lines.append(self._row(self._prompt_content()))
             cursor = (len(lines) - 1, 4 + self.input_cursor)
         else:

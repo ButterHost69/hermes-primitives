@@ -241,9 +241,9 @@ pi-pipeline /path/to/codebase --theme light
 ```
 
 You are prompted for the bug report first.  The `reproduce` role then runs
-while you watch it stream, and before each following role starts you can press
-Enter to continue, type a message to add as operator context, or `/quit`.  Once
-the pipeline finishes, the collected role results are printed below the screen.
+while you watch it stream, and the following roles start automatically as each
+one finishes.  Once the pipeline finishes, the collected role results are
+printed below the screen.
 
 ### Flow
 
