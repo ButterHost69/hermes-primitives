@@ -79,6 +79,20 @@ def _primitive_work(diagnosis: Any) -> list[tuple[str, str]]:
     return work
 
 
+
+def _primitive_updates(report: Any) -> list[dict[str, Any]]:
+    """Return the ``files_to_update`` entries of a primitive's JSON report."""
+    try:
+        value = json.loads(report)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(value, dict):
+        return []
+    updates = value.get("files_to_update")
+    if not isinstance(updates, list):
+        return []
+    return [entry for entry in updates if isinstance(entry, dict)]
+
 class Pipeline:
     """Runs roles over a codebase, beginning with the reproduce role.
 
@@ -180,37 +194,66 @@ class Pipeline:
         primitives run under this pipeline's model, reasoning level, working
         directory, and observer, and their reports come back keyed by source
         file.  Every primitive streams through the one observer, so each one
-        is given a wrapper that tags its records with the file it owns: a
-        fan-out's records arrive interleaved, and only the tag says whose
-        agent produced which.  The fan-out itself is published as it runs —
-        the files it spans, and which of them came back or failed — so an
-        observer can follow the primitives one by one.
+        is given a wrapper that tags its records with the file it owns.
 
-        ``call_all`` fans the primitives out over a pool and closes each
-        session as the fan-out ends; the registry is closed again after
-        it — closing is idempotent — so no Pi session outlives the role.
+        After a pass completes, the reports are parsed for ``files_to_update``;
+        every entry pointing at a file becomes work for a follow-up pass, with
+        all entries for one file clubbed into a JSON array.  Passes repeat
+        until a pass yields no ``files_to_update`` or the pass cap is reached.
         """
         work = _primitive_work(diagnosis)
-        objectives = dict(work)
+        objectives = {source_file: objective for source_file, objective in work}
         if context:
             objectives = {
                 source_file: f"{objective}\n\n{context}"
                 for source_file, objective in objectives.items()
             }
-        files = list(dict.fromkeys(source_file for source_file, _ in work))
-        manager = PrimitiveManager(objectives=objectives)
-        for source_file in files:
-            manager.create_primitive(
-                source_file, **self._primitive_kwargs(source_file)
+        all_reports: dict[str, str] = {}
+        current_objectives = objectives
+        max_passes = 5
+        pass_index = 0
+        while pass_index < max_passes and current_objectives:
+            files = list(dict.fromkeys(current_objectives))
+            manager = PrimitiveManager(objectives=current_objectives)
+            for source_file in files:
+                manager.create_primitive(
+                    source_file, **self._primitive_kwargs(source_file)
+                )
+            self._publish(
+                {"type": FANNED_OUT_TYPE, "files": files, "pass": pass_index + 1}
             )
-        self._publish({"type": FANNED_OUT_TYPE, "files": files})
-        try:
-            return manager.call_all(
-                on_report=self._primitive_reported,
-                on_failure=self._primitive_failed,
-            )
-        finally:
-            manager.close()
+            try:
+                reports = manager.call_all(
+                    on_report=self._primitive_reported,
+                    on_failure=self._primitive_failed,
+                )
+            finally:
+                manager.close()
+            for source_file, report in reports.items():
+                all_reports[source_file] = report
+
+            next_objectives: dict[str, list[dict[str, Any]]] = {}
+            for report in reports.values():
+                for entry in _primitive_updates(report):
+                    target = entry.get("file")
+                    if not isinstance(target, str) or not target:
+                        continue
+                    next_objectives.setdefault(target, []).append(entry)
+
+            if not next_objectives:
+                break
+
+            current_objectives = {
+                target: json.dumps(entries) for target, entries in next_objectives.items()
+            }
+            if context:
+                current_objectives = {
+                    source_file: f"{objective}\n\n{context}"
+                    for source_file, objective in current_objectives.items()
+                }
+            pass_index += 1
+
+        return all_reports
 
     def _primitive_kwargs(self, source_file: str) -> dict[str, Any]:
         """Return the session kwargs for one primitive of the fan-out.

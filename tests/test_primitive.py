@@ -29,6 +29,10 @@ class StubSession:
         self.run_calls.append(message)
         return self.outputs.pop(0)
 
+    def retry(self, *args, **kwargs):
+        self.run_calls.append("RETRY")
+        return self.outputs.pop(0)
+
     def close(self):
         self.closed = True
 
@@ -73,7 +77,7 @@ def test_primitive_fields(stubs):
 
 
 def test_primitive_grants_all_tools(stubs):
-    stubs["outputs"].append("report")
+    stubs["outputs"].append('{"result":"report"}')
     Primitive("a.py").run("fix it")
 
     session = stubs["sessions"][0]
@@ -93,11 +97,11 @@ def test_primitive_sends_prompt_and_briefing(stubs):
         thinking="low",
         cwd="/tmp/x",
     )
-    stubs["outputs"].append("fixed the loop")
+    stubs["outputs"].append('{"result":"fixed the loop"}')
 
     result = target.run("fix the crash")
 
-    assert result == "fixed the loop"
+    assert result == '{"result":"fixed the loop"}'
     # The session created with the primitive stays open: the primitive reuses
     # it for later objectives instead of spawning a Pi subprocess per run.
     session = target.session
@@ -117,7 +121,7 @@ def test_primitive_sends_prompt_and_briefing(stubs):
 
 
 def test_primitive_briefing_without_dependencies(stubs):
-    stubs["outputs"].append("no change needed")
+    stubs["outputs"].append('{"result":"no change needed"}')
     Primitive("solo.py").run("tidy it")
 
     message = stubs["sessions"][0].run_calls[0]
@@ -127,12 +131,12 @@ def test_primitive_briefing_without_dependencies(stubs):
 
 def test_primitive_reuses_one_session_across_objectives(stubs):
     target = Primitive("a.py")
-    stubs["outputs"].extend(["first", "second"])
+    stubs["outputs"].extend(['{"result":"first"}', '{"result":"second"}'])
 
     first = target.run("objective one")
     second = target.run("objective two")
 
-    assert (first, second) == ("first", "second")
+    assert (first, second) == ('{"result":"first"}', '{"result":"second"}')
     # One session for the whole primitive: the second run reuses the one
     # opened at construction instead of spawning another Pi subprocess.
     assert len(stubs["sessions"]) == 1
@@ -161,7 +165,7 @@ def test_primitive_forwards_observer(stubs):
     def observer(record):
         seen.append(record)
 
-    stubs["outputs"].append("report")
+    stubs["outputs"].append('{"result":"report"}')
     Primitive("a.py", observer=observer).run("fix it")
     assert stubs["sessions"][0].kwargs["observer"] is observer
 
@@ -380,6 +384,8 @@ def test_primitive_blocks_a_write_to_a_dependency(gate_pi, tmp_path, monkeypatch
         return wrapped
 
     monkeypatch.setattr(primitive_module, "writes_only_to", spy)
+    from utils.json_utils import JsonCheck
+    monkeypatch.setattr(primitive_module, "verify_json", lambda text: JsonCheck(ok=True, value={}, error=None))
 
     target = Primitive(
         source_file="src/app.py",
@@ -401,7 +407,7 @@ def test_primitive_from_the_manager_is_gated(stubs):
 
     manager = PrimitiveManager()
     target = manager.create_primitive("src/app.py")
-    stubs["outputs"].append("report")
+    stubs["outputs"].append('{"result":"report"}')
 
     target.run("fix it")
 

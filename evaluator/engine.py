@@ -92,6 +92,7 @@ def evaluate_case(
     thinking: str | None = None,
     observer: Callable[[dict[str, Any]], None] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    grade_timeout: float | None = None,
     grade_all: bool = False,
     no_grade: bool = False,
     skip_project_tests: bool = False,
@@ -156,6 +157,7 @@ def evaluate_case(
                     model=model,
                     thinking=thinking,
                     observer=observer,
+                    timeout=grade_timeout,
                 )
                 outcome = grade.verdict
             else:
@@ -172,6 +174,7 @@ def evaluate_case(
                 model=model,
                 thinking=thinking,
                 observer=observer,
+                timeout=grade_timeout,
             )
             outcome = grade.verdict
     except PiError as exc:
@@ -200,6 +203,7 @@ def evaluate_cases(
     thinking: str | None = None,
     observer: Callable[[dict[str, Any]], None] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    grade_timeout: float | None = None,
     grade_all: bool = False,
     no_grade: bool = False,
     skip_project_tests: bool = False,
@@ -235,6 +239,7 @@ def evaluate_cases(
                 thinking=thinking,
                 observer=observer,
                 timeout=timeout,
+                grade_timeout=grade_timeout,
                 grade_all=grade_all,
                 no_grade=no_grade,
                 skip_project_tests=skip_project_tests,

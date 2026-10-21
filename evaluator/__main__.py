@@ -16,6 +16,7 @@ from pathlib import Path
 from evaluator.case import discover_cases
 from evaluator.engine import evaluate_cases
 from evaluator.errors import EvaluatorError
+from evaluator.grader import DEFAULT_GRADE_TIMEOUT
 from evaluator.report import Report
 from evaluator.runner import DEFAULT_TIMEOUT
 
@@ -136,6 +137,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"per-suite timeout in seconds (default: {DEFAULT_TIMEOUT:g})",
     )
     parser.add_argument(
+        "--grade-timeout",
+        metavar="SEC",
+        type=float,
+        default=DEFAULT_GRADE_TIMEOUT,
+        help=(
+            "inactivity timeout per grader model turn in seconds "
+            f"(default: {DEFAULT_GRADE_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
         "--skip-project-tests",
         action="store_true",
         help="do not run the codebases' own test suites",
@@ -177,6 +188,7 @@ def run(args: argparse.Namespace) -> tuple[Report, Path, Path | None]:
         model=args.model,
         thinking=args.thinking,
         timeout=args.timeout,
+        grade_timeout=args.grade_timeout,
         grade_all=args.grade_all,
         no_grade=args.no_grade,
         skip_project_tests=args.skip_project_tests,

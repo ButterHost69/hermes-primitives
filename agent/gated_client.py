@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -265,6 +266,7 @@ class GatedPiSession(PiSession):
         self.timeout = timeout
         self._parts: list[str] = []
         self._settled = threading.Event()
+        self._last_activity = time.monotonic()
         self.client = GatedPiClient(
             tools=tools,
             model=model,

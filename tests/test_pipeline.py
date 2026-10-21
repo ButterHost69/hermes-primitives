@@ -24,7 +24,11 @@ class StubSession:
         if self.error is not None:
             raise self.error
         self.runs.append(prompt)
-        return "report"
+        return '{"files_to_update":[],"change_note":"report"}'
+
+    def retry(self, *args, **kwargs):
+        self.runs.append("RETRY")
+        return '{"files_to_update":[],"change_note":"report"}'
 
     def close(self):
         self.closed = True
@@ -191,8 +195,8 @@ def test_run_calls_every_primitive_the_diagnosis_found(diagnosis_roles, tmp_path
     results = pipe.run("x")
 
     assert results["primitive_manager"] == {
-        "src/app.py": "report",
-        "src/db.py": "report",
+        "src/app.py": '{"files_to_update":[],"change_note":"report"}',
+        "src/db.py": '{"files_to_update":[],"change_note":"report"}',
     }
     assert pipe.state["primitive_manager"] == results["primitive_manager"]
     # one primitive per diagnosed file, and each one was called exactly once
@@ -281,8 +285,8 @@ def test_the_fan_out_publishes_its_own_lifecycle(diagnosis_roles, tmp_path):
     ]
     # reports stream as the primitives finish, which the pool orders
     assert dict((r["primitive"], r["report"]) for r in reported) == {
-        "src/app.py": "report",
-        "src/db.py": "report",
+        "src/app.py": '{"files_to_update":[],"change_note":"report"}',
+        "src/db.py": '{"files_to_update":[],"change_note":"report"}',
     }
 
 

@@ -13,6 +13,7 @@ import roles.primitive_manager
 from agent import PiError
 from agent.gated_client import GatedPiSession
 from roles.primitive import Primitive
+from utils.json_utils import JsonCheck
 from roles.primitive_manager import (
     UNSTATED_OBJECTIVE,
     PrimitiveCloseError,
@@ -63,6 +64,9 @@ class StubSession:
                 self.set_event.set()
         return f"report: {prompt}"
 
+    def retry(self, *args, **kwargs) -> str:
+        return "report: retry"
+
     def close(self):
         if self.close_error is not None:
             raise self.close_error
@@ -80,6 +84,11 @@ def stub_sessions(monkeypatch):
         return session
 
     monkeypatch.setattr(roles.primitive, "GatedPiSession", make_session)
+    monkeypatch.setattr(
+        roles.primitive,
+        "verify_json",
+        lambda text: JsonCheck(ok=True, value={}, error=None),
+    )
     return created
 
 

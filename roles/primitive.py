@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import PiError, load_prompt
+from utils import verify_json
+import json
 from agent.gated_client import GatedPiSession, Policy
 from agent.tools import BUILTIN_TOOLS
 
@@ -134,7 +136,20 @@ class Primitive:
         if self.session is None:
             raise PiError(f"this primitive is closed: {self.source_file}")
         prompt = load_prompt(PROMPTS_DIR / "primitive.md")
-        return self.session.run(f"{prompt}\n\n{_briefing(issue, self)}")
+        output = self.session.run(f"{prompt}\n\n{_briefing(issue, self)}")
+        check = verify_json(output)
+        if not check.ok:
+            retry_message = (
+                "Your previous response was not valid JSON. "
+                "Respond again with only valid JSON matching the required shape "
+                "and no other text.\n\n"
+                f"The parser reported: {check.error}"
+            )
+            output = self.session.retry(message=retry_message)
+            check = verify_json(output)
+        if not check.ok:
+            raise PiError("primitive output was not valid JSON after a retry")
+        return output
 
     def close(self) -> None:
         """Close the attached Pi session; the primitive cannot run afterwards."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import threading
 
 import pytest
 
@@ -266,6 +267,35 @@ def test_run_explicit_timeout_override(make_session):
     client, session = make_session(events=[], timeout=5.0)
     with pytest.raises(PiError, match="timed out"):
         session.run("x", timeout=0.05)
+
+
+def test_run_resets_the_timeout_while_events_keep_arriving(make_session):
+    """A turn longer than ``timeout`` survives as long as Pi keeps streaming."""
+    client, session = make_session(events=[], timeout=0.1)
+    deltas = ["x"] * 8
+
+    def stream():
+        for delta in deltas:
+            time.sleep(0.04)
+            client.emit({
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": delta},
+            })
+        client.emit({"type": "agent_settled", "aborted": False})
+
+    streamer = threading.Thread(target=stream)
+    prompt = client.prompt
+
+    def prompt_then_stream(*args, **kwargs):
+        response = prompt(*args, **kwargs)
+        streamer.start()
+        return response
+
+    client.prompt = prompt_then_stream
+    try:
+        assert session.run("x") == "".join(deltas)
+    finally:
+        streamer.join(timeout=5)
 
 
 def test_run_raises_when_pi_dies_before_the_turn_settles(make_session):

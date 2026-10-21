@@ -33,6 +33,10 @@ CRITERIA_MAX = {"correctness": 40, "equivalence": 25, "minimality": 20, "quality
 PASS_BAND = 85
 PARTIAL_BAND = 60
 
+# A grading turn inspects the tree and may run test suites, so it needs more
+# room than the deterministic suites' own timeout.
+DEFAULT_GRADE_TIMEOUT = 600.0
+
 VERDICTS = ("pass", "partial", "fail")
 
 
@@ -172,12 +176,14 @@ def grade_case(
     model: str | None = None,
     thinking: str | None = None,
     observer: Callable[[dict[str, Any]], None] | None = None,
+    timeout: float | None = None,
 ) -> Grade:
     """Grade one case with a Pi session and return the normalized grade.
 
     Raises :class:`PiError` when the model's answer is not valid JSON after
     one retry, and :class:`GraderFormatError` when it is JSON but carries no
-    usable grade.
+    usable grade.  ``timeout`` caps inactivity during each model turn; it
+    defaults to :data:`DEFAULT_GRADE_TIMEOUT`.
     """
     envelope = {
         "case": case.number,
@@ -199,6 +205,7 @@ def grade_case(
         thinking=thinking,
         cwd=str(case.codebase),
         observer=observer,
+        timeout=timeout if timeout is not None else DEFAULT_GRADE_TIMEOUT,
     ) as session:
         output = session.run(f"{prompt}\n\n{json.dumps(envelope, indent=2)}")
         check = verify_json(output)

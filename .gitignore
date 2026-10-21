@@ -12,3 +12,6 @@ wheels/
 # Pi session files
 /.sessions/
 .environment
+
+# Generated evaluator artifacts
+evaluation-artifacts/
