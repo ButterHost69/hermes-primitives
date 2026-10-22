@@ -81,6 +81,17 @@ def writes_only_to(source_file: str, cwd: str | None = None) -> Policy:
     return policy
 
 
+def _compose_policy(read_policy: Policy, write_policy: Policy) -> Policy:
+    """Apply ``write_policy`` to writes and ``read_policy`` to everything else."""
+
+    def policy(request: dict[str, Any]) -> dict[str, Any]:
+        if request.get("toolName") in WRITE_TOOLS:
+            return write_policy(request)
+        return read_policy(request)
+
+    return policy
+
+
 @dataclass
 class Primitive:
     """One unit of code.
@@ -102,6 +113,10 @@ class Primitive:
     observer: Callable[[dict[str, Any]], None] | None = field(
         default=None, repr=False
     )
+    #: Optional policy for every non-write tool.  The primitive's own
+    #: write/edit gate is always composed on top, so a benchmark can confine
+    #: reads to a repository without giving up the per-artifact write fence.
+    read_policy: Policy | None = field(default=None, repr=False)
     session: GatedPiSession | None = field(init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -113,13 +128,19 @@ class Primitive:
         bash, stays available because the primitive has to reason about the
         system and run what it changed.
         """
+        write_policy = writes_only_to(self.source_file, self.cwd)
+        policy = (
+            write_policy
+            if self.read_policy is None
+            else _compose_policy(self.read_policy, write_policy)
+        )
         self.session = GatedPiSession(
             tools=ALL_TOOLS,
             model=self.model,
             thinking=self.thinking,
             cwd=self.cwd,
             observer=self.observer,
-            policy=writes_only_to(self.source_file, self.cwd),
+            policy=policy,
         )
 
     def run(self, issue: str) -> str:

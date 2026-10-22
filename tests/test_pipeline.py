@@ -59,19 +59,19 @@ def fake_roles(monkeypatch):
     diagnose_calls: list[dict] = []
     sessions: list[StubSession] = []
 
-    def reproduce(text, *, model=None, thinking=None, cwd=None, observer=None, context=None):
+    def reproduce(text, *, model=None, thinking=None, cwd=None, observer=None, context=None, policy=None):
         reproduce_calls.append(
             {"text": text, "model": model, "thinking": thinking, "cwd": cwd,
-             "observer": observer, "context": context}
+             "observer": observer, "context": context, "policy": policy}
         )
         return {"summary": "reproduced", "test_fails": True}
 
     diagnose_output = {"summary": "diagnosed"}
 
-    def diagnose(text, *, model=None, thinking=None, cwd=None, observer=None, context=None):
+    def diagnose(text, *, model=None, thinking=None, cwd=None, observer=None, context=None, policy=None):
         diagnose_calls.append(
             {"text": text, "model": model, "thinking": thinking, "cwd": cwd,
-             "observer": observer, "context": context}
+             "observer": observer, "context": context, "policy": policy}
         )
         return json.loads(json.dumps(diagnose_output))
 
@@ -175,6 +175,29 @@ def test_run_step_passes_context_and_observer(fake_roles, tmp_path):
     call = fake_roles["reproduce"][0]
     assert call["context"] == "extra"
     assert call["observer"] is observer
+
+
+def test_policy_is_passed_to_roles_and_primitives(diagnosis_roles, tmp_path):
+    def policy(request):
+        if request.get("toolName") == "read":
+            return {"action": "block", "reason": "outside the repository"}
+        return {"action": "allow"}
+
+    pipe = pipeline.Pipeline(
+        tmp_path, "claude", "low", "secret", observer=lambda record: None, policy=policy
+    )
+
+    pipe.run("x")
+
+    assert diagnosis_roles["reproduce"][0]["policy"] is policy
+    assert diagnosis_roles["diagnose"][0]["policy"] is policy
+    for session in diagnosis_roles["sessions"]:
+        # The primitive composes the pipeline policy for non-write tools with
+        # its own write gate; the read policy is therefore visible through the
+        # composed callable rather than as a separate session argument.
+        composed = session.kwargs["policy"]
+        assert composed({"toolName": "read", "input": {"path": "x"}})["action"] == "block"
+        assert composed({"toolName": "write", "input": {"path": "x"}})["action"] == "block"
 
 
 def test_run_does_not_pass_observer_when_none(fake_roles, tmp_path):

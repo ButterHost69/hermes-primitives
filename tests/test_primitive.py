@@ -69,6 +69,7 @@ def test_primitive_fields(stubs):
         "thinking",
         "cwd",
         "observer",
+        "read_policy",
         "session",
     ]
     target = Primitive("a.py")
@@ -281,6 +282,26 @@ def test_primitive_opens_a_gated_session(stubs):
     session = stubs["sessions"][0]
     assert session.kwargs["tools"] == primitive_module.ALL_TOOLS
     assert callable(session.kwargs["policy"])
+
+
+def test_primitive_composes_a_read_policy_with_its_write_gate(stubs):
+    seen: list[dict] = []
+
+    def read_policy(request):
+        seen.append(request)
+        return {"action": "block", "reason": "outside the repository"}
+
+    target = Primitive("src/app.py", cwd="/repo", read_policy=read_policy)
+    policy = target.session.kwargs["policy"]
+
+    assert policy(_request("read", "/etc/passwd")) == {
+        "action": "block",
+        "reason": "outside the repository",
+    }
+    assert seen[-1]["toolName"] == "read"
+    # The write gate is composed on top, so a read policy never decides a write.
+    assert policy(_request("write", "src/app.py")) == {"action": "allow"}
+    assert policy(_request("write", "src/other.py"))["action"] == "block"
 
 
 def test_gate_allows_every_tool_that_is_not_a_write():

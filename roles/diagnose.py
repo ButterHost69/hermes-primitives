@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import PiError, PiSession, load_prompt
+from agent.gated_client import GatedPiSession, Policy
 from utils import missing_paths, verify_json
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -70,24 +71,31 @@ def diagnose(
     cwd: str | None = None,
     observer: Callable[[dict[str, Any]], None] | None = None,
     context: str | None = None,
+    policy: Policy | None = None,
 ) -> dict:
     """Diagnose ``text`` (an error trace) and return the model's JSON verdict.
 
     ``observer``, when given, is registered as an extra event listener on the
     session's RPC client so callers can stream progress without changing the
     synchronous request/response contract.  ``context`` is appended to the
-    role prompt as optional operator guidance.
+    role prompt as optional operator guidance.  ``policy``, when given, runs
+    the role through a gated session so every tool call is decided before it
+    executes.
     """
     prompt = load_prompt(PROMPTS_DIR / "diagnose.md")
     if context:
         prompt += "\n\n" + context
-    with PiSession(
-        tools=READ_ONLY_TOOLS,
-        model=model,
-        thinking=thinking,
-        cwd=cwd,
-        observer=observer,
-    ) as session:
+    session_kwargs: dict[str, Any] = {
+        "tools": READ_ONLY_TOOLS,
+        "model": model,
+        "thinking": thinking,
+        "cwd": cwd,
+        "observer": observer,
+    }
+    if policy is not None:
+        session_kwargs["policy"] = policy
+    session_class = GatedPiSession if policy is not None else PiSession
+    with session_class(**session_kwargs) as session:
         output = session.run(prompt + "\n\n" + text)
         check = verify_json(output)
         missing = _missing_finding_files(check.value, cwd=cwd) if check.ok else []

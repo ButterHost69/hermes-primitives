@@ -140,9 +140,20 @@ evaluator/
 ├── prompts/
 │   └── grade.md    # the grader prompt template (rubric + output contract)
 └── __main__.py     # CLI entry point (python -m evaluator / pi-evaluate)
+
+benchmarks/
+├── dataset.py      # load SWE-bench rows (HF dataset viewer or local JSON/JSONL)
+├── repo.py         # base-commit tarball checkout, patch capture, apply check
+├── policy.py       # repository-scoped tool gate (paths, shell, unknown tools)
+├── runner.py       # pipeline/agent runs, transcripts, predictions, harness call
+├── cli.py          # CLI entry point (python -m benchmarks / pi-swebench)
+├── prompts/
+│   └── swebench.md # the plain-agent patch prompt
+├── README.md       # setup, usage, outputs, and limits
+└── RESULTS.md      # the first end-to-end smoke test and its outcomes
 ```
 
-Requires the `pi` executable on `PATH` and Python 3.9+.
+Requires the `pi` executable on `PATH` and Python 3.14+.
 
 ## Roles
 
@@ -411,3 +422,28 @@ console table stays deterministic; `--report-dir` writes per-case artifacts
 
 Exit codes: `0` every case passed, `1` the run finished but something failed,
 `2` a setup problem (no environment, no cases, bad arguments).
+
+## SWE-bench
+
+`benchmarks/` runs hms against [SWE-bench](https://github.com/swe-bench/SWE-bench)
+tasks and writes the patch predictions the official harness grades.  For each
+task it downloads the base commit's GitHub tarball, commits it as a local
+baseline, runs either the role chain (`--mode pipeline`) or one patch-oriented
+Pi session (`--mode agent`), captures the tree diff, checks that it applies,
+and records one `model_patch` row:
+
+```sh
+python -m benchmarks.swebench --instance-id pallets__flask-4045 --dry-run
+python -m benchmarks.swebench --instance-id pallets__flask-4045 --skip-reproduce
+
+# Grade with the official harness (installed separately, in its own venv)
+python -m benchmarks.swebench --instance-id pallets__flask-4045 --skip-reproduce \
+    --evaluate --swebench-bin .swebench/swebench-venv/bin/swebench
+```
+
+The defaults are `SWE-bench/SWE-bench_Lite`, `opencode-go/cat-jam-free`, and
+`max` reasoning.  Host checkouts do not install a project's dependencies, so
+`--skip-reproduce` is recommended (diagnose works from the issue and source);
+the official harness runs the project's tests in its own image.  See
+[benchmarks/README.md](benchmarks/README.md) for the harness setup, output
+layout, and the containerized-agent limitation.

@@ -120,6 +120,29 @@ def test_reproduce_disables_write_capable_tools(stubs):
     assert "bash" in tools
 
 
+def test_reproduce_uses_a_gated_session_when_a_policy_is_given(stubs, monkeypatch):
+    policy = lambda request: {"action": "allow"}  # noqa: E731
+    gated: list[StubSession] = []
+
+    def make_gated(**kwargs):
+        session = StubSession(['{"reproduced": false}'], **kwargs)
+        gated.append(session)
+        return session
+
+    monkeypatch.setattr(reproduce_module, "GatedPiSession", make_gated)
+    monkeypatch.setattr(
+        reproduce_module,
+        "PiSession",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("ungated session")),
+    )
+    stubs["set_verify"]([JsonCheck(ok=True, value={"reproduced": False})])
+
+    reproduce_module.reproduce("hi", policy=policy)
+
+    assert gated[0].kwargs["policy"] is policy
+    assert gated[0].closed is True
+
+
 def test_reproduce_retries_when_output_is_not_json(stubs):
     stubs["outputs"].extend(["not json", '{"ok": true}'])
     stubs["set_verify"]([

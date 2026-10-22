@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 from agent import PiError
+from agent.gated_client import Policy
 from roles.primitive import Primitive
 
 # A primitive registered without a stated objective still has to be told what
@@ -73,14 +74,16 @@ class PrimitiveManager:
         thinking: str | None = None,
         cwd: str | None = None,
         observer: Callable[[dict[str, Any]], None] | None = None,
+        read_policy: Policy | None = None,
     ) -> Primitive:
         """Create a Primitive, register it under ``source_file``, return it.
 
         The model, reasoning level, working directory, and observer configure
-        the gated session the primitive opens.  A Primitive already registered
-        under ``source_file`` is returned as it is: registering a fresh one
-        would drop the Pi session it has attached and the dependency
-        relationships it has accumulated.
+        the gated session the primitive opens.  ``read_policy``, when given,
+        confines every non-write tool (the per-artifact write gate is always
+        applied).  A Primitive already registered under ``source_file`` is
+        returned as it is: registering a fresh one would drop the Pi session it
+        has attached and the dependency relationships it has accumulated.
         """
         registered = self.primitive_map.get(source_file)
         if registered is not None:
@@ -91,6 +94,7 @@ class PrimitiveManager:
             thinking=thinking,
             cwd=cwd,
             observer=observer,
+            read_policy=read_policy,
         )
         self.primitive_map[source_file] = primitive
         return primitive
@@ -103,6 +107,7 @@ class PrimitiveManager:
         thinking: str | None = None,
         cwd: str | None = None,
         observer: Callable[[dict[str, Any]], None] | None = None,
+        read_policy: Policy | None = None,
     ) -> list[Primitive]:
         """Register a Primitive for every path in ``source_files``.
 
@@ -116,6 +121,7 @@ class PrimitiveManager:
                 thinking=thinking,
                 cwd=cwd,
                 observer=observer,
+                read_policy=read_policy,
             )
             for source_file in source_files
         ]

@@ -117,6 +117,30 @@ def test_diagnose_success_first_try(stubs):
     assert missing_calls == [["a.py"]]
 
 
+def test_diagnose_uses_a_gated_session_when_a_policy_is_given(stubs, monkeypatch):
+    policy = lambda request: {"action": "allow"}  # noqa: E731
+    gated: list[StubSession] = []
+
+    def make_gated(**kwargs):
+        session = StubSession(['{"findings": []}'], **kwargs)
+        gated.append(session)
+        return session
+
+    monkeypatch.setattr(diagnose_module, "GatedPiSession", make_gated)
+    monkeypatch.setattr(
+        diagnose_module,
+        "PiSession",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("ungated session")),
+    )
+    stubs["set_verify"]([JsonCheck(ok=True, value={"findings": []})])
+    stubs["set_missing"]([[]])
+
+    diagnose_module.diagnose("traceback", policy=policy)
+
+    assert gated[0].kwargs["policy"] is policy
+    assert gated[0].closed is True
+
+
 def test_diagnose_disables_write_capable_tools(stubs):
     stubs["outputs"].append("{}")
     stubs["set_verify"]([JsonCheck(ok=True, value={})])

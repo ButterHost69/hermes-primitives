@@ -20,6 +20,7 @@ pi-reproduce = "roles.reproduce:main"
 pi-pipeline = "tui.__main__:main"
 pi-run-all = "tui.run_all:main"
 pi-evaluate = "evaluator.__main__:main"
+pi-swebench = "benchmarks.cli:main"
 
 [dependency-groups]
 dev = [
@@ -43,7 +44,7 @@ skip_covered = true
 fail_under = 100
 
 [tool.setuptools]
-packages = ["agent", "evaluator", "roles", "tui", "utils"]
+packages = ["agent", "benchmarks", "evaluator", "roles", "tui", "utils"]
 py-modules = ["main", "pipeline"]
 
 [tool.uv]

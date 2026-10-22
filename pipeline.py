@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.gated_client import Policy
 from roles import diagnose as diagnose_role
 from roles import reproduce as reproduce_role
 from roles.primitive_manager import PrimitiveManager
@@ -112,6 +113,11 @@ class Pipeline:
         API key for roles that call a model API directly. The roles run
         through Pi (which supplies its own credentials), so this is held for
         later use rather than forwarded.
+    policy:
+        Optional tool policy for every role.  Reproduce and diagnose run
+        through a gated session when it is given; primitives compose it with
+        their per-artifact write gate, so a benchmark can confine reads and
+        the shell to a checkout without losing the write fence.
     """
 
     def __init__(
@@ -122,12 +128,14 @@ class Pipeline:
         api_key: str,
         *,
         observer: Callable[[dict[str, Any]], None] | None = None,
+        policy: Policy | None = None,
     ) -> None:
         self.codebase_path = Path(codebase_path).resolve()
         self.model_name = model_name
         self.reasoning = reasoning
         self.api_key = api_key
         self.observer = observer
+        self.policy = policy
         self.state: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ #
@@ -164,8 +172,12 @@ class Pipeline:
         """Shared keyword arguments for role invocations.
 
         ``context`` is only included when given, for the same reason.
+        ``policy`` is only included when the pipeline has one, so a caller
+        that never opts into gating keeps the plain session path.
         """
         kwargs = self._session_kwargs()
+        if self.policy is not None:
+            kwargs["policy"] = self.policy
         if context is not None:
             kwargs["context"] = context
         return kwargs
@@ -260,11 +272,15 @@ class Pipeline:
 
         The observer a pipeline was given is shared by every primitive, so it
         is replaced here with one that tags what it forwards; a pipeline no
-        one is watching keeps the plain ``None``.
+        one is watching keeps the plain ``None``.  The pipeline policy, when
+        set, is handed over as ``read_policy``: the primitive's own write gate
+        is composed on top inside :class:`~roles.primitive.Primitive`.
         """
         kwargs = self._session_kwargs()
         if kwargs.get("observer") is not None:
             kwargs["observer"] = self._tagged_observer(source_file)
+        if self.policy is not None:
+            kwargs["read_policy"] = self.policy
         return kwargs
 
     def _tagged_observer(
