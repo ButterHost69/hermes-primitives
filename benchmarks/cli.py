@@ -52,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Materialize SWE-bench tasks, let hms edit them, write a "
             "predictions file, and optionally grade it with the official harness."
         ),
+        epilog=(
+            "Replay a saved transcript with: "
+            f"{PROG} replay <run-dir> [--instance ID]"
+        ),
     )
     parser.add_argument(
         "--dataset",
@@ -192,7 +196,7 @@ def _print_task(instance, index: int, total: int) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def run_main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     workdir = Path(args.workdir)
     run_id = _safe_run_id(args.run_id or time.strftime("%Y%m%d-%H%M%S"))
@@ -298,6 +302,16 @@ def main(argv: list[str] | None = None) -> int:
         max_workers=args.eval_workers,
         timeout=args.eval_timeout,
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch ``replay`` or the default run command."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "replay":
+        from benchmarks.replay import replay_main
+
+        return replay_main(arguments[1:])
+    return run_main(arguments)
 
 
 if __name__ == "__main__":  # pragma: no cover

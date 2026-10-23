@@ -155,12 +155,55 @@ cd .swebench/runs/<run-id>
     -p predictions.jsonl --run-id eval-1 -j 1
 ```
 
-## What the smoke test showed
+## Replay
+
+Every run writes one `transcript.jsonl` per task.  Replay one without a model,
+Docker, or network access:
+
+```bash
+# Single-task run: the task is implied
+.venv/bin/pi-swebench replay .swebench/runs/swe-pass-4/instances/psf__requests-2148
+
+# Multi-task run: choose the task
+.venv/bin/pi-swebench replay .swebench/runs/swe-pass-3 \
+    --instance pallets__flask-4992
+
+# Start with the final state already built, then inspect/scroll
+.venv/bin/pi-swebench replay .swebench/runs/swe-pass-4 \
+    --instance psf__requests-2148 --start end --paused
+```
+
+The replay uses the live TUI's renderer, so the primitive panel, per-file
+streams, tool activity, and gate blocks are rebuilt from the transcript.  It
+is read-only and starts at the first record playing at 60 records/s by default.
+
+| Key | Action |
+|---|---|
+| `Space` / `p` | play/pause |
+| `→` / `←` | step one record forward/back |
+| `n` | jump to the next non-text event (tool, report, fan-out) |
+| `g` / `G` | jump to the start / final state |
+| `r` | restart from the beginning and play |
+| `[` / `]` | halve / double playback speed |
+| `Tab` | move along the primitives of a fan-out |
+| `Enter` | open the highlighted primitive |
+| `Esc` / `q` / `Backspace` | leave a primitive |
+| `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` | scroll |
+| `q` | quit the replay |
+
+`--all-events` replays the raw stream instead of the visually meaningful
+records; `--no-thinking` drops thinking deltas; `--theme light` switches the
+palette.  The panel's elapsed times are replay-relative, not the original
+wall-clock times.
+
+## What the runs showed
 
 A first end-to-end check on `pallets__flask-4045` and `psf__requests-3362`
 resolved both instances once the repo policy was in place; the Flask task also
-needed an explicit-exception prompt rule.  The earlier attempts, the failing
-assertion-vs-`ValueError` case, and the harness gold control are recorded in
+needed an explicit-exception prompt rule.  A later 10-task Lite sample from
+three repositories scored 5 resolved of 9 completed tasks, with one
+interrupted.  The earlier attempts, the failing assertion-vs-`ValueError`
+case, the interrupted run, and the harness gold control are recorded in
 [RESULTS.md](RESULTS.md).
 
 ## Limits

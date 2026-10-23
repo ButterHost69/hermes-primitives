@@ -1,17 +1,81 @@
-# SWE-bench smoke test
+# SWE-bench runs
 
-A first end-to-end check of `pi-swebench`, run on 2026-10-21 from this checkout.
-This is a **smoke test**, not a benchmark score: one or two instances per mode
-is enough to prove the adapter, the path policy, and the official harness work
-together.
+These are checks of `pi-swebench`, run from this checkout.  They are not
+benchmark scores: the first is a smoke test, the second is a six-instance
+sample from SWE-bench Lite.  Both use the same fixed configuration:
+`opencode-go/cat-jam-free` with thinking `max`.
 
-- Model: `opencode-go/cat-jam-free`, thinking `max`
 - Dataset: `SWE-bench/SWE-bench_Lite` (saved to `/tmp/swe_lite.json` for the
-  adapter; the harness loaded the Hugging Face id)
+  adapter; the harness loaded the same local file)
 - Harness: `swebench==5.0.2` in a separate Python 3.13 venv
 - Docker: 29.6.2, prebuilt instance images pulled from Docker Hub
-- Gold control: the dataset's reference patch was resolved for every instance
+- Gold control: the dataset's reference patch was resolved for the instance
   used to validate the harness.
+
+## Lite pass (2026-10-22, two batches)
+
+`pipeline` mode, `--skip-reproduce`, repository-scoped tool policy, the
+explicit-exception prompt.  Ten tasks were chosen from three small/medium
+repositories and short issue statements, so this is a sample, not a random
+Lite estimate.  The pass ran in two batches (`swe-pass-3` and `swe-pass-4`).
+
+| Instance | Patch | Resolved | Verdict detail |
+|---|---|---|---|
+| `pallets__flask-4992` | 63 lines | no | `test_config_from_file_toml` (`Config.from_file()` got an unexpected `text` kwarg) |
+| `pallets__flask-5063` | 71 lines | no | `test_subdomain` / `test_host` (printed `Domain`, expected `Subdomain`/`Host`) |
+| `psf__requests-1963` | 13 lines | **yes** | — |
+| `psf__requests-2674` | 93 lines | **yes** | — |
+| `psf__requests-2148` | 80 lines | **yes** | — |
+| `psf__requests-2317` | 35 lines | interrupted | patch applied; test run interrupted after 23/143 tests (slow network-bound suite); not scored |
+| `psf__requests-863` | 49 lines | **yes** | — |
+| `pytest-dev__pytest-5221` | 30 lines | no | `test_show_fixtures` / `test_show_fixtures_verbose` |
+| `pytest-dev__pytest-5495` | 24 lines | no | `test_bytes_diff_normal` / `test_bytes_diff_verbose` |
+| `pytest-dev__pytest-7432` | 17 lines | **yes** | — |
+
+Result: **5 resolved of 9 scored tasks (55.6%)**, 0 errors, 0 empty patches;
+the tenth task was interrupted because its test suite was progressing too
+slowly to finish the pass.  Model time was about 21 minutes total (sum of
+per-instance durations); official evaluation pulled ten instance images
+sequentially and took longer.
+
+`psf__requests-2317` is excluded from the denominator.  Its harness log
+records `>>>>> Applied Patch` and the test suite had started
+(23 of 143 tests ran before the interrupt), but the interrupted run's
+`report.json` marks `patch_successfully_applied: false` because the test
+output never reached the end marker.  It is an interrupted run, not a verdict.
+
+The failures are instructive:
+
+- **Flask 4992** was an API-shape miss: the test calls
+  `Config.from_file(..., text=...)`, while the patch invented
+  `mode`/`encoding`/`errors` parameters.  The pipeline implemented a plausible
+  feature rather than the requested one.
+- **Flask 5063** changed the `flask routes` table to a `Domain` column, but
+  the oracle expects distinct `Subdomain`/`Host` headers and exact column
+  formatting.
+- **pytest 5221** changed `--fixtures` output but did not match the expected
+  documentation layout.
+- **pytest 5495** adjusted byte-sequence repr but still missed the expected
+  `test_bytes_diff_*` output.
+
+Every completed task produced a patch that applied cleanly, and every
+completed failure was a test verdict rather than an infrastructure error.
+
+### Provider note
+
+Two earlier attempts hit repeated
+`429: Upstream request failed: Endpoint is unavailable` from
+`opencode-go/cat-jam-free`, exhausted Pi's auto-retries, and were stopped.  A
+one-shot probe also timed out intermittently.  After a ten-minute cooldown the
+pass ran without errors.  The scored batches are `swe-pass-3` and
+`swe-pass-4`; their evaluation run ids are `swe-pass-3-eval` and
+`swe-pass-4-eval` / `swe-pass-4-eval-b`.
+
+## Smoke test (2026-10-21)
+
+A first end-to-end check of `pi-swebench`.  This is a **smoke test**, not a
+benchmark score: one or two instances per mode is enough to prove the adapter,
+the path policy, and the official harness work together.
 
 ## Results
 
@@ -56,7 +120,17 @@ changed exactly those validation sites.
 ## Artifacts
 
 Per-run transcripts, patches, and reports are under
-`.swebench/runs/<run-id>/` (gitignored).  For a resolved run:
+`.swebench/runs/<run-id>/` (gitignored).  For the Lite pass:
+
+```bash
+cat .swebench/runs/swe-pass-3/predictions.jsonl
+cat .swebench/runs/swe-pass-4/predictions.jsonl
+cat .swebench/runs/swe-pass-3/instances/psf__requests-1963/patch.diff
+cat .swebench/runs/swe-pass-3/logs/run_evaluation/swe-pass-3-eval/\
+hms-opencode-go-cat-jam-free-max-pipeline/psf__requests-1963/report.json
+```
+
+For the resolved smoke-test run:
 
 ```bash
 cat .swebench/runs/flask-pipeline-4/predictions.jsonl

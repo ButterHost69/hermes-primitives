@@ -125,6 +125,7 @@ tui/
 ├── __main__.py     # CLI entry point (python -m tui / pi-pipeline)
 ├── app.py          # PipelineApp: drives the pipeline in a live terminal UI
 ├── primitives.py   # PrimitiveFeed: one labelled stream per fanned-out primitive
+├── replay.py       # ReplayApp: the same view, fed from a saved transcript
 ├── screen.py       # raw mode, frame painting, and key parsing
 ├── theme.py        # OKHSL -> ANSI truecolor, matching Pi's dark/light themes
 └── transcript.py   # ordered, bounded stream of role activity
@@ -146,11 +147,12 @@ benchmarks/
 ├── repo.py         # base-commit tarball checkout, patch capture, apply check
 ├── policy.py       # repository-scoped tool gate (paths, shell, unknown tools)
 ├── runner.py       # pipeline/agent runs, transcripts, predictions, harness call
+├── replay.py       # select and replay a saved transcript in the TUI
 ├── cli.py          # CLI entry point (python -m benchmarks / pi-swebench)
 ├── prompts/
 │   └── swebench.md # the plain-agent patch prompt
-├── README.md       # setup, usage, outputs, and limits
-└── RESULTS.md      # the first end-to-end smoke test and its outcomes
+├── README.md       # setup, usage, replay, outputs, and limits
+└── RESULTS.md      # smoke test and Lite-pass outcomes
 ```
 
 Requires the `pi` executable on `PATH` and Python 3.14+.
@@ -444,6 +446,7 @@ python -m benchmarks.swebench --instance-id pallets__flask-4045 --skip-reproduce
 The defaults are `SWE-bench/SWE-bench_Lite`, `opencode-go/cat-jam-free`, and
 `max` reasoning.  Host checkouts do not install a project's dependencies, so
 `--skip-reproduce` is recommended (diagnose works from the issue and source);
-the official harness runs the project's tests in its own image.  See
-[benchmarks/README.md](benchmarks/README.md) for the harness setup, output
-layout, and the containerized-agent limitation.
+the official harness runs the project's tests in its own image.  A saved
+transcript can be watched with `pi-swebench replay <run-dir>`; see
+[benchmarks/README.md](benchmarks/README.md) for the harness setup, replay
+keys, output layout, and the containerized-agent limitation.
